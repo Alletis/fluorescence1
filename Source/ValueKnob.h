@@ -88,6 +88,20 @@ public:
     void setMagentaAccent(bool enabled) { magentaAccent = enabled; repaint(); }
     void setLinearTrackEndCap(LinearEndCap c) { linearTrackEndCap = c; repaint(); }
     void setLinearFillEndCap(LinearEndCap c) { linearFillEndCap = c; repaint(); }
+    void setVisualDisabled(bool shouldLookDisabled)
+    {
+        setVisualDisableAmount(shouldLookDisabled ? 1.0f : 0.0f);
+    }
+    void setVisualDisableAmount(float amount)
+    {
+        amount = juce::jlimit(0.0f, 1.0f, amount);
+        if(std::abs(amount - visualDisableTarget) < 1.0e-4f)
+            return;
+        visualDisableStart = visualDisableAmount;
+        visualDisableTarget = amount;
+        visualDisablePhase = 0.0f;
+        visualDisableAnimating = true;
+    }
     bool keyPressed(const juce::KeyPress& k) override
     {
         const auto c = k.getTextCharacter();
@@ -107,8 +121,25 @@ private:
     void timerCallback() override
     {
         bool moving = false;
-        const juce::Colour discTarget = dragging ? juce::Colour(0xff30303a)
-                                                  : juce::Colour(0xff1d1d23);
+        if(visualDisableAnimating)
+        {
+            visualDisablePhase = juce::jmin(1.0f, visualDisablePhase + visualDisablePhaseStep);
+            const float eased = 0.5f - 0.5f * std::cos(visualDisablePhase * juce::MathConstants<float>::pi);
+            const float nextAmount = visualDisableStart + (visualDisableTarget - visualDisableStart) * eased;
+            if(std::abs(nextAmount - visualDisableAmount) > 1.0e-4f)
+            {
+                visualDisableAmount = nextAmount;
+                moving = true;
+            }
+            if(visualDisablePhase >= 1.0f)
+            {
+                visualDisableAmount = visualDisableTarget;
+                visualDisableAnimating = false;
+            }
+        }
+        const juce::Colour discBaseTarget = dragging ? juce::Colour(0xff30303a)
+                                                      : juce::Colour(0xff1d1d23);
+        const juce::Colour discTarget = applyVisualDisable(discBaseTarget, juce::Colour(0xff2a2a31), 0.55f);
         if(! discPrimed) { discS.set(discTarget); discPrimed = true; moving = true; }
         else if(discS.approach(discTarget, 1.0f / 3.0f)) moving = true;
         const double eps = (getMaximum() - getMinimum()) * 1.0e-4 + 1.0e-9;
@@ -147,7 +178,7 @@ private:
         }
         juce::Path track;
         track.addCentredArc(cx, cy, rArc, rArc, 0.0f, startAngle, endAngle, true);
-        g.setColour(juce::Colour(0xff4a4a54));
+        g.setColour(applyVisualDisable(juce::Colour(0xff4a4a54), juce::Colour(0xff34343c), 0.80f));
         g.strokePath(track, juce::PathStrokeType(trackW, juce::PathStrokeType::curved,
                                                            juce::PathStrokeType::butt));
         if(std::abs(valueAngle - splitAngle) > 1.0e-3f)
@@ -167,6 +198,11 @@ private:
                 juce::Graphics::ScopedSaveState ss(g);
                 g.reduceClipRegion(wedge);
                 g.drawImageAt(arcImage, 0, 0);
+                if(visualDisableAmount > 0.001f)
+                {
+                    g.setColour(juce::Colour(0xff777782).withAlpha(0.82f * visualDisableAmount));
+                    g.fillPath(wedge);
+                }
             }
             else
             {
@@ -174,7 +210,7 @@ private:
                 fill.addCentredArc(cx, cy, rArc, rArc, 0.0f,
                                     juce::jmin(splitAngle, valueAngle),
                                     juce::jmax(splitAngle, valueAngle), true);
-                g.setColour(juce::Colour(0xff45aeb1));
+                g.setColour(accentColour());
                 g.strokePath(fill, juce::PathStrokeType(trackW, juce::PathStrokeType::curved,
                                                                   juce::PathStrokeType::butt));
             }
@@ -187,7 +223,7 @@ private:
         juce::Path ptr;
         ptr.startNewSubPath(0.0f, -rInnerH);
         ptr.lineTo(0.0f, -rOuter);
-        g.setColour(juce::Colour(0xffe8e8ee));
+        g.setColour(applyVisualDisable(juce::Colour(0xffe8e8ee), juce::Colour(0xff8e8e96), 0.92f));
         g.strokePath(ptr, juce::PathStrokeType(handleW, juce::PathStrokeType::curved,
                                                           juce::PathStrokeType::butt),
                       juce::AffineTransform::rotation(valueAngle).translated(cx, cy));
@@ -237,7 +273,7 @@ private:
         const float hw = juce::jmax(9.0f, h * 0.5f);
         const float corner = juce::jmin(h * 0.5f, hw * 0.5f);
         const float travelW = juce::jmax(0.0f, b.getWidth() - hw);
-        g.setColour(juce::Colour(0xff4a4a54));
+        g.setColour(applyVisualDisable(juce::Colour(0xff4a4a54), juce::Colour(0xff55555f), 0.40f));
         fillHorizontalWithEndCap(g, b.getX(), top, b.getWidth(), h, corner, linearTrackEndCap);
         const double mn = getMinimum(), mx = getMaximum();
         const bool bipolar = (mn < 0.0 && mx > 0.0);
@@ -258,7 +294,7 @@ private:
         g.setColour(accentColour());
         fillHorizontalWithEndCap(g, x0, top, juce::jmax(1.0f, x1 - x0), h, corner, linearFillEndCap);
         const float tx = xV;
-        g.setColour(juce::Colour(0xffe8e8ee));
+        g.setColour(applyVisualDisable(juce::Colour(0xffe8e8ee), juce::Colour(0xff8e8e96), 0.92f));
         g.fillRoundedRectangle(tx - hw * 0.5f, top, hw, h, corner);
     }
     void drawVertical(juce::Graphics& g)
@@ -270,7 +306,7 @@ private:
         const float hh = juce::jmax(9.0f, w * 0.5f);
         const float corner = juce::jmin(w * 0.5f, hh * 0.5f);
         const float travelH = juce::jmax(0.0f, b.getHeight() - hh);
-        g.setColour(juce::Colour(0xff4a4a54));
+        g.setColour(applyVisualDisable(juce::Colour(0xff4a4a54), juce::Colour(0xff55555f), 0.40f));
         g.fillRoundedRectangle(left, b.getY(), w, b.getHeight(), corner);
         const double mn = getMinimum(), mx = getMaximum();
         const double splitVal = (mn < 0.0 && mx > 0.0) ? 0.0 : mn;
@@ -283,7 +319,7 @@ private:
         g.setColour(accentColour());
         g.fillRect(left, y0, w, juce::jmax(1.0f, y1 - y0));
         const float ty = yV;
-        g.setColour(juce::Colour(0xffe8e8ee));
+        g.setColour(applyVisualDisable(juce::Colour(0xffe8e8ee), juce::Colour(0xff8e8e96), 0.92f));
         g.fillRoundedRectangle(left, ty - hh * 0.5f, w, hh, corner);
     }
     static void fillHorizontalWithEndCap(juce::Graphics& g,
@@ -354,11 +390,17 @@ private:
         out = v;
         return true;
     }
+    juce::Colour applyVisualDisable(juce::Colour base, juce::Colour greyTarget, float strength = 1.0f) const
+    {
+        const float mix = juce::jlimit(0.0f, 1.0f, visualDisableAmount * strength);
+        return base.interpolatedWith(greyTarget, mix);
+    }
     juce::Colour accentColour() const
     {
-        return magentaAccent ? juce::Colour(0xffeb8fff).withMultipliedSaturation(0.62f)
-                                               .withMultipliedBrightness(0.80f)
-                             : juce::Colour(0xff45aeb1);
+        const auto base = magentaAccent ? juce::Colour(0xffeb8fff).withMultipliedSaturation(0.62f)
+                                                             .withMultipliedBrightness(0.80f)
+                                        : juce::Colour(0xff45aeb1);
+        return applyVisualDisable(base, juce::Colour(0xff4b4b52), 1.0f);
     }
     juce::TextEditor editor;
     juce::Rectangle<int> entryBounds;
@@ -371,6 +413,12 @@ private:
     bool dragging = false;
     bool gradientArc = false;
     bool magentaAccent = false;
+    float visualDisableAmount = 0.0f;
+    float visualDisableStart = 0.0f;
+    float visualDisableTarget = 0.0f;
+    float visualDisablePhase = 1.0f;
+    bool visualDisableAnimating = false;
+    static constexpr float visualDisablePhaseStep = 1.0f / 10.0f;
     LinearEndCap linearTrackEndCap = LinearEndCap::BothRounded;
     LinearEndCap linearFillEndCap = LinearEndCap::Square;
     juce::Image arcImage;

@@ -371,7 +371,8 @@ private:
     PianoRoll pianoRoll;
     ScalePanel scalePanel;
     MenuDotsButton menuButtonA;
-    RoundToggle enhanceTransientBtn;
+    SmoothTextButton enhanceTransientBtn { "BASIC" };
+    SmoothTextButton rendererModeBtn { "SPECTRAL" };
     FlyoutPanel flyoutA;
     struct MouseSpy : juce::MouseListener
     {
@@ -404,6 +405,8 @@ private:
     float uiZoom = 1.0f;
     float lastSavedZoom = -1.0f;
     bool sizeRestoreDone = false;
+    juce::RangedAudioParameter* tonalRendererChoiceParam = nullptr;
+    std::atomic<float>* tonalRendererVisualParam = nullptr;
     void timerCallback() override;
     void applyModeAlphas();
     float modePhase = 0.0f;
@@ -484,7 +487,7 @@ private:
                 auto row = panelRect.reduced(24, 0).withTop(logoRect.getBottom() + 4).withHeight(18);
                 g.setColour(juce::Colour(0xffc4c4cc));
                 g.setFont(KnobLookAndFeel::courier(KnobLookAndFeel::uiFont));
-                g.drawText("           Version 1.1.0", row, juce::Justification::centredLeft, false);
+                g.drawText("           Version 1.1.4", row, juce::Justification::centredLeft, false);
                 g.drawText("By Project Alletis           ", row, juce::Justification::centredRight, false);
             }
             const float arrowA = 0.35f + 0.65f * pageAlpha;
@@ -513,15 +516,17 @@ private:
             {
                 y += 22 + 8;
                 drawSection(g, "SPECIAL THANKS", y, pageAlpha); y += 20;
-                for(auto* n : { "ZL Audio, Cure Audio, saundix, YuanYuy,",
-                                "sukabing, A.C.F., IAMMRGODIE, Meowtronix,",
-                                "sout, Killy, KPa_11, farah, Hck,"})
+                y += 14;
+                for(auto* n : { "DTM Community, Cure Audio, ZL Audio;",
+                                "A.C.F., farah, Hck, IAMMRGODIE, Killy,",
+                                "KPa_11, Meowtronix, Rainbow Illusion,",
+                                "RHYX, saundix, sout, sukabing, YuanYuy;"})
                 {
                     drawLine(g, n, y, pageAlpha);
                     y += 14;
                 }
-                y += 4;
-                drawLine(g, "and you, for testing this plugin rn.", y, pageAlpha);
+                y += 14;
+                drawLine(g, "and you, for using this plugin rn.", y, pageAlpha);
             }
         }
         void mouseDown(const juce::MouseEvent& e) override
@@ -594,8 +599,25 @@ private:
         void timerCallback() override
         {
             const float t = open ? 1.0f : 0.0f;
-            if(std::abs(t - anim) >= 0.0004f) { anim += (t - anim) / 3.0f; setAlpha(anim); }
-            else if(anim != t) { anim = t; setAlpha(anim); if(! open) setVisible(false); }
+            if(! animInProgress || t != animEnd)
+            {
+                animStart = anim;
+                animEnd = t;
+                animPhase = 0.0f;
+                animInProgress = true;
+            }
+            animPhase = juce::jmin(1.0f, animPhase + animStep);
+            const float eased = 0.5f - 0.5f * std::cos(animPhase * juce::MathConstants<float>::pi);
+            anim = animStart + (animEnd - animStart) * eased;
+            setAlpha(anim);
+            if(animPhase >= 1.0f)
+            {
+                anim = animEnd;
+                setAlpha(anim);
+                animInProgress = false;
+                if(! open)
+                    setVisible(false);
+            }
             bool moving = false;
             if(pageWanted != page)
             {
@@ -616,6 +638,11 @@ private:
         }
         bool open = false;
         float anim = 0.0f;
+        float animStart = 0.0f;
+        float animEnd = 0.0f;
+        float animPhase = 1.0f;
+        bool animInProgress = false;
+        static constexpr float animStep = 1.0f / 9.0f;
         int page = 0, pageWanted = 0;
         float pageAlpha = 1.0f;
         float pagePhase = 1.0f;

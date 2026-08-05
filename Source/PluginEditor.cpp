@@ -45,6 +45,7 @@ NewProjectAudioProcessorEditor::NewProjectAudioProcessorEditor(NewProjectAudioPr
     spectrum.setMidiMask(&p.getMidiScaleMask());
     scSpectrum.setForceTargetColour(true);
     spectrum.setSidechainTargetCount(&p.getSidechainTargetCount());
+    spectrum.setDisableUiEnabled(true);
     content.addAndMakeVisible(bypassModeBtn);
     bypassModeBtn.setClickingTogglesState(true);
     bypassModeBtn.setNeutralStyle(true);
@@ -115,6 +116,7 @@ NewProjectAudioProcessorEditor::NewProjectAudioProcessorEditor(NewProjectAudioPr
     fineTune.setSliderStyle(juce::Slider::LinearVertical);
     fineTune.setSliderSnapsToMousePosition(false);
     fineTune.setMagentaAccent(true);
+    fineTune.setDisplayDecimals(0);
     fineTune.setWheelStep(25.0);
     envComp.setSliderStyle(juce::Slider::LinearHorizontal);
     envComp.setSliderSnapsToMousePosition(false);
@@ -126,6 +128,13 @@ NewProjectAudioProcessorEditor::NewProjectAudioProcessorEditor(NewProjectAudioPr
     formant.setWheelStep(1.0);
     attraction.setGradientArc(true);
     attraction.setWheelStep(0.05);
+    tonalRendererChoiceParam = dynamic_cast<juce::RangedAudioParameter*> (proc.apvts.getParameter("tonalRenderer"));
+    tonalRendererVisualParam = proc.apvts.getRawParameterValue("tonalRenderer");
+    rendererModeBtn.setToggleState(tonalRendererVisualParam != nullptr
+                                    && juce::roundToInt(tonalRendererVisualParam->load()) == 1,
+                                    juce::dontSendNotification);
+    morph.setVisualDisabled(tonalRendererVisualParam != nullptr
+                             && juce::roundToInt(tonalRendererVisualParam->load()) == 1);
     styleLabel(fftLbl, "FFT SIZE");
     styleLabel(overlapLbl, "FFT OVERLAP");
     styleLabel(stereoLbl, "STEREO");
@@ -170,7 +179,27 @@ NewProjectAudioProcessorEditor::NewProjectAudioProcessorEditor(NewProjectAudioPr
     flyoutA.addAndMakeVisible(envCompLbl);
     flyoutA.addAndMakeVisible(envComp);
     flyoutA.addAndMakeVisible(enhanceTransientBtn);
+    flyoutA.addAndMakeVisible(rendererModeBtn);
     enhanceTransientAtt = std::make_unique<BA> (p.apvts, "enhanceTransient", enhanceTransientBtn);
+    enhanceTransientBtn.setClickingTogglesState(true);
+    enhanceTransientBtn.textProvider = [this]
+    {
+        return enhanceTransientBtn.getToggleState() ? "ENHANCED" : "BASIC";
+    };
+    rendererModeBtn.setClickingTogglesState(true);
+    rendererModeBtn.textProvider = [this]
+    {
+        return rendererModeBtn.getToggleState() ? "ADDITIVE" : "SPECTRAL";
+    };
+    rendererModeBtn.onClick = [this]
+    {
+        if(tonalRendererChoiceParam == nullptr)
+            return;
+        const float nextIndex = rendererModeBtn.getToggleState() ? 1.0f : 0.0f;
+        tonalRendererChoiceParam->beginChangeGesture();
+        tonalRendererChoiceParam->setValueNotifyingHost(tonalRendererChoiceParam->convertTo0to1 (nextIndex));
+        tonalRendererChoiceParam->endChangeGesture();
+    };
     content.addAndMakeVisible(menuButtonA);
     menuButtonA.onClick = [this]
     {
@@ -213,6 +242,7 @@ NewProjectAudioProcessorEditor::NewProjectAudioProcessorEditor(NewProjectAudioPr
         flyoutA.show();
         menuButtonA.setActive(true);
     }
+    startTimerHz(60);
     sizeRestoreDone = true;
 }
 NewProjectAudioProcessorEditor::~NewProjectAudioProcessorEditor()
@@ -248,6 +278,18 @@ void NewProjectAudioProcessorEditor::applyModeAlphas()
 }
 void NewProjectAudioProcessorEditor::timerCallback()
 {
+    if(tonalRendererVisualParam != nullptr)
+    {
+        const bool additiveOn = juce::roundToInt(tonalRendererVisualParam->load()) == 1;
+        morph.setVisualDisabled(additiveOn);
+        if(rendererModeBtn.getToggleState() != additiveOn)
+            rendererModeBtn.setToggleState(additiveOn, juce::dontSendNotification);
+    }
+    if(std::abs(modePhase - modeTarget) < 1.0e-4f)
+    {
+        modePhase = modeTarget;
+        return;
+    }
     const float speed = 2.0f / 10.0f;
     if(modePhase < modeTarget) modePhase = juce::jmin(modeTarget, modePhase + speed);
     else modePhase = juce::jmax(modeTarget, modePhase - speed);
@@ -256,7 +298,6 @@ void NewProjectAudioProcessorEditor::timerCallback()
     {
         modePhase = modeTarget;
         applyModeAlphas();
-        stopTimer();
     }
 }
 void NewProjectAudioProcessorEditor::setupKnob(ValueKnob& k, const juce::String& id,
@@ -428,12 +469,47 @@ void NewProjectAudioProcessorEditor::handleGlobalMouseMove(const juce::MouseEven
     if(flyoutA.isOpen() && flyoutA.hitTestPin(e.getEventRelativeTo(&flyoutA).position))
         hintText = "Pin\n\nPrevents additional options from hiding when clicking outside.";
     if(hintText.isEmpty())
+    {
+        auto spectrumHintFor = [&] (SpectrumDisplay& display, bool sidechain) -> juce::String
+        {
+            const auto zone = display.hoverZoneAt(e.getEventRelativeTo(&display).position);
+            if(zone == SpectrumDisplay::HoverZone::disableRow)
+            {
+                return sidechain
+                         ? "Disabled Bands (Sidechain)\n\nDrag the lower and upper frequency cutoffs to bypass sidechain frequencies outside the kept band.\n\nThe closer handle in the row is the one you adjust."
+                         : "Disabled Bands\n\nDrag the lower and upper frequency cutoffs to bypass frequencies outside the kept band.\n\nThe closer handle in the row is the one you adjust.";
+            }
+            if(zone == SpectrumDisplay::HoverZone::plot)
+            {
+                return sidechain
+                         ? "Spectrum (Sidechain)\n\nDisplays Phase-Vocoder frequencies and detected bases for sidechain input.\n\nSee Main Spectrum for more detail."
+                         : "Spectrum (Main)\n\nDisplays Phase-Vocoder frequencies and detected bases.\nDrag your mouse on the spectrum to change detection range.\n\nLeft-Right: Centre\nUp-Down: Spread";
+            }
+            return {};
+        };
+        for(auto* c = e.eventComponent; c != nullptr; c = c->getParentComponent())
+        {
+            if(c == &spectrum)
+            {
+                hintText = spectrumHintFor(spectrum, false);
+                break;
+            }
+            if(c == &scSpectrum)
+            {
+                hintText = spectrumHintFor(scSpectrum, true);
+                break;
+            }
+            if(c == this)
+                break;
+        }
+    }
+    if(hintText.isEmpty())
         hintText = findHoverHintTextForComponent(e.eventComponent);
     if(hintText.isEmpty())
     {
         const auto p = e.getEventRelativeTo(&content).position.toInt();
         if(logoArea.contains(p))
-            hintText = "-\n\nVersion: 1.1.2";
+            hintText = "-\n\nVersion: 1.1.4";
     }
     hoverHintBox.setHintText(hintText);
     ValueKnob* knob = nullptr;
@@ -491,18 +567,19 @@ juce::String NewProjectAudioProcessorEditor::findHoverHintTextForComponent(juce:
         if(c == &moreBasesBtn) return "More Bases\n\nDetects and accepts more fundamentals in the candidate range.";
         if(c == &hysteresisBtn) return "Hysteresis\n\nStabilises base detection over time. \nBases with high confidence persist through brief dropouts and resist flicker between nearby target pitches.";
         if(c == &midSideBtn) return "Stereo\n\nSelect the stereo processing domain.\n\nLeft - Right: \nprocess channels independently.\nMid - Side: \nprocess Mid and Side components.";
-        if(c == &enhanceTransientBtn) return "Enhance Transient\n\nClick to switch between basic and enhanced transient detection.";
+        if(c == &enhanceTransientBtn) return "Enhance Transient\n\nSwitch between basic and enhanced transient detection.";
+        if(c == &rendererModeBtn) return "Renderer\n\nSwitch between spectral IFFT and time-domain additive for resynthesis.\n\nDisables Morph when Additive is selected.";
         if(c == &transient) return "Transient\n\nBypasses processing on detected attacks.\nHigher values preserve more transients.";
         if(c == &transpose) return "Transpose (Main)\n\nRepitches input audio before analysis and processing.";
         if(c == &formant) return "Formant\n\nShifts the spectral envelope up or down to the transposed audio.\nTends to make voices thinner or thicker.";
         if(c == &scTranspose) return "Transpose (Sidechain)\n\nRepitches sidechain audio before analysis.";
         if(c == &attraction) return "Attraction\n\nAmount each detected fundamental and its harmonics are shifted towards its nearest target pitch.";
         if(c == &emphasis) return "Emphasis\n\nHigher values move inharmonics closer to the nearest integer harmonic of a fundamental.";
-        if(c == &morph) return "Morph\n\nBlends synthesised phases toward the detected partial structure.\nHigher values lock harmonics and preserve wave shapes better.";
+        if(c == &morph) return "Morph\n\nBlends synthesised phases toward the detected partial structure. Higher values lock harmonics and preserve wave shapes.\nDisabled in Additive mode.";
         if(c == &density) return "Density\n\nHigher values accept more weak candidates as detected fundamentals.";
         if(c == &feedback) return "Feedback\n\nBoosts retuned fundamentals and their harmonics shifted near targets.";
         if(c == &fineTune) return "Fine Tune\n\nAmount in cents to shift the target notes by.";
-        if(c == &envComp) return "Compensation\n\nFlattens synthesised spectrum to correct energy build-up when nearby frequencies accumulate during Phase-Vocoder synthesis.";
+        if(c == &envComp) return "Compensation\n\nPositive values flatten the synthesised magnitude response, while negative values exaggerate them.";
         if(c == &pianoRoll) return "Piano Roll\n\nScale: \nClick notes here to modify the target scale.\n\nMIDI: \nDisplays the current MIDI input.";
         if(c == &spectrum || c == &spectrumCoordOverlay) return "Spectrum (Main)\n\nDisplays Phase-Vocoder frequencies and detected bases.\nDrag your mouse on the spectrum to change detection range.\n\nLeft-Right: Centre\nUp-Down: Spread";
         if(c == &scSpectrum || c == &scSpectrumCoordOverlay) return "Spectrum (Sidechain)\n\nDisplays Phase-Vocoder frequencies and detected bases for sidechain input.\n\nSee Main Spectrum for more detail.";
@@ -669,7 +746,7 @@ void NewProjectAudioProcessorEditor::resized()
     auto clusterBand = right.removeFromBottom(rowH);
     right.removeFromBottom(pad);
     auto transposeBand = right.removeFromBottom(transH);
-    right.removeFromBottom(pad);
+    right.removeFromBottom(pad + 4);
     auto spectrumBand = right;
     spectrum.setBounds(spectrumBand);
     {
@@ -732,13 +809,15 @@ void NewProjectAudioProcessorEditor::resized()
         const int mPadX = 44;
         const int mPadY = 16;
         const int comboH = 26;
+        const int modeBtnH = 26;
         const int togH = 30;
         const int rowGap = 6;
         const int topRowH = dMenu + 2 + labelH;
+        const int modeRowH = modeBtnH;
         const int compH = labelH + 24;
         const int ovH = labelH + comboH;
         const int flyW = mPadX * 2 + dMenu * 3 + gMenu * 2;
-        const int flyH = mPadY * 2 + topRowH + 10 + compH + 10 + compH + rowGap + ovH + 4 + togH;
+        const int flyH = mPadY * 2 + topRowH + 8 + modeRowH + 8 + compH + 10 + compH + rowGap + ovH + 4 + togH;
         flyoutA.setBounds(scalePanel.getRight() - flyW, (bandBottom - btnSide) - 8 - flyH, flyW, flyH);
         flyoutA.prewarmBackdrop();
         auto inner = juce::Rectangle<int> (0, 0, flyW, flyH).reduced(mPadX, mPadY);
@@ -760,11 +839,12 @@ void NewProjectAudioProcessorEditor::resized()
         placeMenuKnob(transient, transientLbl, colT);
         placeMenuKnob(morph, morphLbl, colM);
         placeMenuKnob(feedback, feedbackLbl, colF);
-        {
-            const auto tb = transient.getBounds();
-            const int td = juce::jlimit(11, 18, juce::roundToInt((float) tb.getWidth() * 0.18f));
-            enhanceTransientBtn.setBounds(tb.getX() + 2 - td, tb.getBottom() - td - 10, td, td);
-        }
+        inner.removeFromTop(8);
+        auto modeRow = inner.removeFromTop(modeRowH);
+        auto enhanceArea = modeRow.removeFromLeft(colMenu);
+        modeRow.removeFromLeft(gMenu);
+        enhanceTransientBtn.setBounds(enhanceArea);
+        rendererModeBtn.setBounds(modeRow);
         const int halfPad = mPadX / 2;
         inner = inner.expanded(mPadX - halfPad, 0);
         inner.removeFromTop(5);

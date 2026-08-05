@@ -37,21 +37,34 @@ private:
     void processPV(int channel);
     void detect(int channel);
     float salience(float F, float centsTolerance) const;
-    float salienceIdx(int candPeak, int harmHorizon = harmonicsMax) const;
+    float salienceIdx(int candPeak, int harmHorizon = salienceHarmonics) const;
     void buildHarmonicMap(float centsTolerance);
+    bool resolvePeakObservation(int channel, int sourceBin, int& analysisBin, float& peakHz) const;
+    void rebuildHarmonicPeakList(int channel, float frameMaxMag);
     std::vector<unsigned char> harmonicMap;
     float snapBaseToScale(float baseHz, float amount, float fineCents) const;
     float nearestTargetMidi(float baseHz) const;
     float snapToTargetMidi(float baseHz, float targetMidi, float amount) const;
     void applyEnvelopeCompensation();
+    void applyTimeAdditiveCompensation(int channel);
+    void buildEnvelopeCompensationCurve(float amount, bool applyToDestination);
+    float envelopeCompensationGainAt(float frequencyHz) const noexcept;
+    float spectralEnvelopeCompAmount() const noexcept;
+    float additiveEnvelopeCompAmount() const noexcept;
     void applyFormantShift(int channel);
     void mapToDestination(int channel, bool computePhase);
     void buildSynthesisKernel();
     void synthesizeAdditive(int channel, bool reseed);
+    void removeTimeAdditiveOwnedSpectrum(int channel);
+    void renderTimeAdditive(int channel);
+    void updateTimeAdditiveVoices(int channel);
+    float estimateTimeAdditiveAmplitude(int peakIndex) const;
+    bool isTimeAdditiveEnabled() const noexcept;
     float detectTransient(int channel);
     void updateTransientBypass(int channel);
     void publishSpectrum();
     float destinationFrequency(float sourceFreq, int bin) const;
+    float effectiveDisableFreqHi() const noexcept;
     static float wrapPhase(float x) noexcept
     {
         return x - juce::MathConstants<float>::twoPi
@@ -109,7 +122,7 @@ private:
         return v.f;
     }
     static inline float fastPow(float x, float p) noexcept { return fastPow2(p * fastLog2(x)); }
-    static constexpr const char* stateVersion = "1.1.2";
+    static constexpr const char* stateVersion = "1.1.5";
     static constexpr int minOrder = 9;
     static constexpr int maxOrder = 13;
     static constexpr int maxFftSize = 1 << maxOrder;
@@ -126,11 +139,12 @@ private:
     static constexpr float transientBinRatioScale = 1.0f;
     static constexpr int defaultMaxPeaks = 64;
     static constexpr int extendedMaxPeaks = 128;
+    static constexpr int maxDetectionPeaks = extendedMaxPeaks;
     static constexpr int defaultMaxBases = 16;
     static constexpr int extendedMaxBases = 48;
-    static constexpr int maxPeaks = extendedMaxPeaks;
+    static constexpr int maxPeaks = maxFftSize / 4;
     static constexpr int maxBases = extendedMaxBases;
-    static constexpr int harmonicsMax = 32;
+    static constexpr int salienceHarmonics = 32;
     static constexpr int nonMidHarmonics = 16;
     static constexpr int harmonicsTagMax = 256;
     static constexpr float centsTol = 35.0f;
@@ -146,6 +160,7 @@ private:
     static constexpr float octaveBias = 0.80f;
     static constexpr float continuityBias = 0.30f;
     static constexpr float peakFloorRel = 0.02f;
+    static constexpr float partialPeakFloorRel = 0.0005f;
     static constexpr float silenceMagFloor = 1.0e-4f;
     static constexpr float tonalRefScale = 0.35f;
     static constexpr int formantEnvIters = 4;
@@ -195,15 +210,17 @@ private:
     std::array<bool, maxChannels> transientInit {};
     std::array<bool, maxChannels> analysisSeed {};
     std::array<bool, maxChannels> synthSeed {};
+    std::array<bool, maxChannels> timeAdditiveWasEnabled {};
     std::vector<float> pvMag, pvFreq, pvPhase;
     std::vector<float> curLogMag;
     std::vector<float> dstMag, dstFreqNum, dstFreq, dstPhase, dstBestMag;
+    std::vector<float> dstRe, dstIm;
     std::vector<float> dstHitCount;
     std::vector<float> dstRetuneWeight;
     std::vector<float> dstRetunePeak;
     std::vector<float> feedbackAddedMag;
     std::vector<float> preFeedbackMag;
-    std::vector<float> envRefMag, envRefPrefix, envOutPrefix;
+    std::vector<float> envRefMag, envRefPrefix, envOutPrefix, envAppliedGain;
     std::vector<float> fmtRawLog, fmtLog, fmtEnvLog, fmtEnv;
     std::array<std::vector<float>, maxChannels> formantGain;
     std::array<std::vector<float>, maxChannels> nextFormantGain;
@@ -227,12 +244,36 @@ private:
         float anaPhase = 0.0f;
         float targetFreq = 0.0f;
         float targetAmp = 0.0f;
+        float timeTargetAmp = 0.0f;
+        float timeOwnership = 0.0f;
+        float targetAffinity = 0.0f;
         int baseIdx = -1;
         int harmonic = 0;
+        float harmonicBaseHz = 0.0f;
+        bool harmonicAmbiguous = false;
         int age = 0;
         int dying = 0;
         bool matched = false;
     };
+    struct OscillatorVoice
+    {
+        int sourcePartialId = -1;
+        double phase = 0.0;
+        float amplitude = 0.0f;
+        float frequency = 0.0f;
+        float targetFrequency = 0.0f;
+        float targetAmplitude = 0.0f;
+        float sourceAmplitude = 0.0f;
+        float sourceRetune = 0.0f;
+        float sourceFrequency = 0.0f;
+        float prevSourceAmplitude = 0.0f;
+        float capHoldAmplitude = 0.0f;
+        float feedbackState = 0.0f;
+        float modelPhase = 0.0f;
+        bool sourcePresent = false;
+        bool phaseValid = false;
+    };
+    std::array<std::vector<OscillatorVoice>, maxChannels> timeVoices;
     struct BasePhaseRef
     {
         float f0Ana = 0.0f;
@@ -262,6 +303,11 @@ private:
     std::vector<float> accCov;
     void updatePartials(int channel);
     void identifyHarmonic(float freqAnalysis, int& baseIdxOut, int& harmonicOut) const;
+    float baseFrequencyForEncodedIndex(int baseIdx) const;
+    float harmonicAssignmentTolerance(int harmonic, float freqHz) const;
+    bool findBaseForHarmonic(float partialHz, int harmonic, float preferredBaseHz,
+                             int& baseIdxOut, float& baseHzOut, float& deviationCentsOut) const;
+    void updatePartialHarmonicAssignment(Partial& partial, int peakIndex, bool newPartial);
     std::vector<float> baseFreq;
     std::vector<float> baseSal;
     std::vector<float> baseDisplayHz;
@@ -314,6 +360,7 @@ private:
     std::atomic<float>* transientParam = nullptr;
     std::atomic<float>* enhanceTransientParam = nullptr;
     std::atomic<float>* morphParam = nullptr;
+    std::atomic<float>* tonalRendererParam = nullptr;
     std::atomic<float>* pitchParam = nullptr;
     std::atomic<float>* formantParam = nullptr;
     std::atomic<float>* emphasisParam = nullptr;
@@ -322,6 +369,8 @@ private:
     std::atomic<float>* feedbackParam = nullptr;
     std::atomic<float>* fineTuneParam = nullptr;
     std::atomic<float>* envCompParam = nullptr;
+    std::atomic<float>* disableFreqLoParam = nullptr;
+    std::atomic<float>* disableFreqHiParam = nullptr;
     std::atomic<float>* centerParam = nullptr;
     std::atomic<float>* spreadParam = nullptr;
     std::atomic<float>* noteParam[12] = { nullptr };
