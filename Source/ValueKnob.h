@@ -81,6 +81,8 @@ public:
     double wheelStep = 0.1;
     juce::String getTextFromValue(double value) override
     {
+        if(displayDecimals == 0)
+            return juce::String((int) std::lround(value)) + getTextValueSuffix();
         return juce::String(value, displayDecimals) + getTextValueSuffix();
     }
     void setDisplayDecimals(int dp) { displayDecimals = juce::jmax(0, dp); }

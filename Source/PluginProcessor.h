@@ -65,6 +65,8 @@ private:
     void publishSpectrum();
     float destinationFrequency(float sourceFreq, int bin) const;
     float effectiveDisableFreqHi() const noexcept;
+    bool isDisableLoActive() const noexcept;
+    bool isDisableHiActive() const noexcept;
     static float wrapPhase(float x) noexcept
     {
         return x - juce::MathConstants<float>::twoPi
@@ -371,6 +373,8 @@ private:
     std::atomic<float>* envCompParam = nullptr;
     std::atomic<float>* disableFreqLoParam = nullptr;
     std::atomic<float>* disableFreqHiParam = nullptr;
+    std::atomic<float>* disableActiveLoParam = nullptr;
+    std::atomic<float>* disableActiveHiParam = nullptr;
     std::atomic<float>* centerParam = nullptr;
     std::atomic<float>* spreadParam = nullptr;
     std::atomic<float>* noteParam[12] = { nullptr };

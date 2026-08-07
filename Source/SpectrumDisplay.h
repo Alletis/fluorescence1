@@ -22,6 +22,8 @@ public:
         spreadParam = apvts.getParameter("detectSpread");
         disableFreqLoParam = apvts.getParameter("disableFreqLo");
         disableFreqHiParam = apvts.getParameter("disableFreqHi");
+        disableActiveLoParam = apvts.getParameter("disableActiveLo");
+        disableActiveHiParam = apvts.getParameter("disableActiveHi");
         attractionParam = apvts.getParameter("attraction");
         bypassParam = apvts.getParameter("pvBypass");
         midiParam = apvts.getParameter("midiMode");
@@ -94,8 +96,10 @@ public:
             g.fillRect(xHigh - 1.0f, plotY, 2.0f, H);
             if(disableUiEnabled)
             {
-                drawDashedLine(g, plot, plotX + freqToX(dispDisableFreqLoHz(), W), juce::Colour(0xffb8b8c0).withAlpha(0.65f));
-                drawDashedLine(g, plot, plotX + freqToX(dispDisableFreqHiHz(), W), juce::Colour(0xffb8b8c0).withAlpha(0.65f));
+                drawDashedLine(g, plot, plotX + freqToX(dispDisableFreqLoHz(), W),
+                                disableHandleStrokeColour(true, disableLoHighlightAmt, disableLoPressAmt).withAlpha(0.65f));
+                drawDashedLine(g, plot, plotX + freqToX(dispDisableFreqHiHz(), W),
+                                disableHandleStrokeColour(false, disableHiHighlightAmt, disableHiPressAmt).withAlpha(0.65f));
             }
             const juce::Colour baseCol = baseLineColour();
             const float stripAlphaScale = 1.0f - bypassVisualAmt;
@@ -161,8 +165,12 @@ public:
     float coordOverlayGetAlpha() const noexcept { return coordOverlayAlpha; }
     juce::String coordOverlayGetText() const
     {
-        return "(" + juce::String(dispCenterHz(), 1) + " Hz, "
-                   + juce::String(dispSpreadVal(), 2) + " spread)";
+        return "(" + juce::String(getCenterHz(), 1) + " Hz, "
+                   + juce::String(getSpread(), 2) + " spread)";
+    }
+    juce::Rectangle<int> coordOverlayAnchorBounds() const
+    {
+        return getPlotBounds().toNearestInt();
     }
     HoverZone hoverZoneAt(juce::Point<float> p) const
     {
@@ -199,27 +207,26 @@ public:
     void mouseDown(const juce::MouseEvent& e) override
     {
         grabKeyboardFocus();
+        currentPressDragged = false;
+        pressStartPos = e.position;
+        pressStartTimeMs = juce::Time::getMillisecondCounterHiRes();
+        fineControlDrag = e.mods.isCtrlDown();
         if(e.mods.isPopupMenu())
         {
+            const auto plot = getPlotBounds();
+            if(! plot.contains(e.position))
+                return;
             juce::PopupMenu menu;
             menu.addItem(1, "Type value: Centre", true, selected == Handle::center);
             menu.addItem(2, "Type value: Spread", true, selected == Handle::spread);
-            if(disableUiEnabled)
-            {
-                menu.addSeparator();
-                menu.addItem(3, "Type value: Disable Lo", true, selected == Handle::disableLo);
-                menu.addItem(4, "Type value: Disable Hi", true, selected == Handle::disableHi);
-            }
             menu.setLookAndFeel(&getLookAndFeel());
             menu.showMenuAsync(juce::PopupMenu::Options{}
-                                    .withTargetComponent(this)
+                                    .withTargetScreenArea(localAreaToGlobal(plot.toNearestInt()))
                                     .withStandardItemHeight(26),
                                 [this] (int choice)
             {
                 if(choice == 1) selectEntryTarget(Handle::center);
                 else if(choice == 2) selectEntryTarget(Handle::spread);
-                else if(choice == 3) selectEntryTarget(Handle::disableLo);
-                else if(choice == 4) selectEntryTarget(Handle::disableHi);
                 entryBuffer.clear();
                 repaint();
             });
@@ -231,6 +238,8 @@ public:
             const auto controls = getDisableControlBounds();
             if(controls.contains(e.position))
             {
+                if(fineControlDrag)
+                    e.source.enableUnboundedMouseMovement(true, false);
                 disableDragging = closestDisableHandle(e.position, plot, controls);
                 disableDragAnchorX = e.position.x;
                 disableLoAnchorX = plot.getX() + freqToX(getDisableFreqLoHz(), plot.getWidth());
@@ -249,6 +258,8 @@ public:
             entryBuffer.clear();
             repaint();
         }
+        if(fineControlDrag)
+            e.source.enableUnboundedMouseMovement(true, false);
         dragging = true;
         anchorCenter = getCenterHz();
         anchorSpread = getSpread();
@@ -257,11 +268,26 @@ public:
     void mouseDrag(const juce::MouseEvent& e) override
     {
         lastMousePos = e.position;
-        if(disableDragging != DisableDragHandle::none)
+        const bool draggingDisableHandle = (disableDragging != DisableDragHandle::none);
+        if(! currentPressDragged)
+        {
+            const double heldMs = juce::Time::getMillisecondCounterHiRes() - pressStartTimeMs;
+            const bool zeroDragGrace = fineControlDrag || heldMs > customDoubleClickWindowMs;
+            const bool exceededDragGrace = draggingDisableHandle
+                ? std::abs(e.position.x - pressStartPos.x) > (zeroDragGrace ? 0.0f : dragStartTriangleGracePx)
+                : e.position.getDistanceFrom(pressStartPos) > (zeroDragGrace ? 0.0f : dragStartGracePx);
+            if(! exceededDragGrace)
+                return;
+            currentPressDragged = true;
+            pendingDoubleClick = false;
+            lastClickTimeMs = 0.0;
+        }
+        if(draggingDisableHandle)
         {
             const auto plot = getPlotBounds();
             const float plotW = plot.getWidth();
-            const float deltaX = e.position.x - disableDragAnchorX;
+            const float deltaScale = fineControlDrag ? fineControlScale : 1.0f;
+            const float deltaX = (e.position.x - disableDragAnchorX) * deltaScale;
             float loX = disableLoAnchorX;
             float hiX = disableHiAnchorX;
             if(disableDragging == DisableDragHandle::low)
@@ -281,33 +307,86 @@ public:
         const auto plot = getPlotBounds();
         const float W = plot.getWidth();
         const float H = plot.getHeight();
-        const float dx = e.position.x - anchorPos.x;
-        const float dy = e.position.y - anchorPos.y;
+        const float deltaScale = fineControlDrag ? fineControlScale : 1.0f;
+        const float dx = (e.position.x - anchorPos.x) * deltaScale;
+        const float dy = (e.position.y - anchorPos.y) * deltaScale;
         setCenterHz(xToFreq(freqToX(anchorCenter, W) + dx, W));
         setSpread(yToSpread(spreadToY(anchorSpread, H) + dy, H));
         revealCoordOverlay();
         repaint();
     }
-    void mouseUp(const juce::MouseEvent&) override
+    void mouseUp(const juce::MouseEvent& e) override
     {
+        if(fineControlDrag)
+        {
+            const auto restorePos = currentFineControlScreenPosition();
+            auto mouseSource = e.source;
+            mouseSource.enableUnboundedMouseMovement(false);
+            mouseSource.setScreenPosition(restorePos);
+        }
         dragging = false;
         disableDragging = DisableDragHandle::none;
+        fineControlDrag = false;
+        if(e.mods.isPopupMenu())
+            return;
+        const double heldMs = juce::Time::getMillisecondCounterHiRes() - pressStartTimeMs;
+        if(heldMs > customDoubleClickWindowMs)
+        {
+            currentPressDragged = false;
+            pendingDoubleClick = false;
+            pendingDoubleClickOnDisableHandle = false;
+            lastClickTimeMs = 0.0;
+            return;
+        }
+        if(currentPressDragged)
+        {
+            currentPressDragged = false;
+            pendingDoubleClick = false;
+            pendingDoubleClickOnDisableHandle = false;
+            lastClickTimeMs = 0.0;
+            return;
+        }
+        finishCustomDoubleClick(e);
+        currentPressDragged = false;
     }
     void mouseDoubleClick(const juce::MouseEvent& e) override
     {
+        juce::ignoreUnused(e);
+    }
+    bool finishCustomDoubleClick(const juce::MouseEvent& e)
+    {
+        const double nowMs = juce::Time::getMillisecondCounterHiRes();
+        const bool withinTime = pendingDoubleClick
+            && (nowMs - lastClickTimeMs) <= customDoubleClickWindowMs;
+        const bool currentClickOnDisableHandle = disableUiEnabled && getDisableControlBounds().contains(e.position);
+        const bool withinDistance = pendingDoubleClick
+            && (pendingDoubleClickOnDisableHandle
+                    ? std::abs(e.position.x - lastClickPos.x) <= customDoubleClickTriangleDistancePx
+                    : e.position.getDistanceFrom(lastClickPos) <= customDoubleClickDistancePx);
+        if(! (withinTime && withinDistance))
+        {
+            pendingDoubleClick = true;
+            lastClickTimeMs = nowMs;
+            lastClickPos = e.position;
+            pendingDoubleClickOnDisableHandle = currentClickOnDisableHandle;
+            return false;
+        }
+        pendingDoubleClick = false;
+        lastClickTimeMs = 0.0;
+        pendingDoubleClickOnDisableHandle = false;
         if(disableUiEnabled)
         {
             const auto plot = getPlotBounds();
             const auto controls = getDisableControlBounds();
             if(controls.contains(e.position))
             {
-                if(closestDisableHandle(e.position, plot, controls) == DisableDragHandle::low) resetDisableLo();
-                else resetDisableHi();
+                if(closestDisableHandle(e.position, plot, controls) == DisableDragHandle::low) toggleDisableLoActive();
+                else toggleDisableHiActive();
                 selected = Handle::none;
                 typing = false;
                 entryBuffer.clear();
                 repaint();
-                return;
+                return true;
             }
         }
         const bool both = (selected == Handle::none);
@@ -315,6 +394,27 @@ public:
         if(both || selected == Handle::spread) resetParam(spreadParam);
         revealCoordOverlay();
         repaint();
+        return true;
+    }
+    juce::Point<float> currentFineControlScreenPosition() const
+    {
+        const auto localPos = currentFineControlLocalPosition();
+        return localPointToGlobal(juce::Point<float> { localPos.x, localPos.y });
+    }
+    juce::Point<float> currentFineControlLocalPosition() const
+    {
+        const auto plot = getPlotBounds();
+        if(disableDragging != DisableDragHandle::none)
+        {
+            const auto controls = getDisableControlBounds();
+            const float x = plot.getX() + freqToX(disableDragging == DisableDragHandle::low
+                                                       ? getDisableFreqLoHz()
+                                                       : dispTargetDisableFreqHiHz(),
+                                                   plot.getWidth());
+            return { x, controls.getCentreY() };
+        }
+        return { plot.getX() + freqToX(getCenterHz(), plot.getWidth()),
+                 plot.getY() + spreadToY(getSpread(), plot.getHeight()) };
     }
     bool keyPressed(const juce::KeyPress& key) override
     {
@@ -459,6 +559,12 @@ private:
                      * smoothRateThird;
         disableLoHighlightAmt = juce::jlimit(0.0f, 1.0f, disableLoHighlightAmt);
         disableHiHighlightAmt = juce::jlimit(0.0f, 1.0f, disableHiHighlightAmt);
+        disableLoPressAmt += (((disableDragging == DisableDragHandle::low) ? 1.0f : 0.0f) - disableLoPressAmt)
+                * smoothRateThird;
+        disableHiPressAmt += (((disableDragging == DisableDragHandle::high) ? 1.0f : 0.0f) - disableHiPressAmt)
+                * smoothRateThird;
+        disableLoPressAmt = juce::jlimit(0.0f, 1.0f, disableLoPressAmt);
+        disableHiPressAmt = juce::jlimit(0.0f, 1.0f, disableHiPressAmt);
         coordOverlayAlpha += (coordOverlayTargetAlpha - coordOverlayAlpha) * smoothRateThird;
         coordOverlayAlpha = juce::jlimit(0.0f, 1.0f, coordOverlayAlpha);
         disableOverlayAlpha += (disableOverlayTargetAlpha - disableOverlayAlpha) * smoothRateThird;
@@ -577,8 +683,24 @@ private:
     {
         setParam(disableFreqHiParam, hz);
     }
-    void resetDisableLo() { setDisableFreqLoHz(fMin); }
-    void resetDisableHi() { setDisableFreqHiHz(fMax); }
+    bool isDisableLoActive() const
+    {
+        return disableActiveLoParam == nullptr || disableActiveLoParam->getValue() >= 0.5f;
+    }
+    bool isDisableHiActive() const
+    {
+        return disableActiveHiParam == nullptr || disableActiveHiParam->getValue() >= 0.5f;
+    }
+    void setDisableLoActive(bool active)
+    {
+        setToggleParam(disableActiveLoParam, active);
+    }
+    void setDisableHiActive(bool active)
+    {
+        setToggleParam(disableActiveHiParam, active);
+    }
+    void toggleDisableLoActive() { setDisableLoActive(! isDisableLoActive()); }
+    void toggleDisableHiActive() { setDisableHiActive(! isDisableHiActive()); }
     struct DisableHandleGeometry
     {
         juce::Path path;
@@ -737,15 +859,36 @@ private:
         {
             const auto geo = makeDisableHandleGeometry(lowHandle, plot, control);
             const float highlight = lowHandle ? disableLoHighlightAmt : disableHiHighlightAmt;
-            g.setColour(juce::Colour(0xffb0b0b8)
-                             .interpolatedWith(juce::Colour(0xffd6d6de), highlight)
-                             .withAlpha(0.92f));
+            const float pressed = lowHandle ? disableLoPressAmt : disableHiPressAmt;
+            g.setColour(disableHandleFillColour(lowHandle, highlight, pressed).withAlpha(0.92f));
             g.fillPath(geo.path);
-            g.setColour(juce::Colour(0xff64646e)
-                             .interpolatedWith(juce::Colour(0xfff0f0f5), highlight)
-                             .withAlpha(0.95f));
+            g.setColour(disableHandleStrokeColour(lowHandle, highlight, pressed).withAlpha(0.95f));
             g.strokePath(geo.path, juce::PathStrokeType(1.0f));
         }
+    }
+    juce::Colour disableHandleFillColour(bool lowHandle, float highlight, float pressedAmt) const
+    {
+        const bool active = lowHandle ? isDisableLoActive() : isDisableHiActive();
+        const auto enabledIdle = juce::Colour(0xff2d6f72);
+        const auto enabledHot = juce::Colour(0xff6ecdd0);
+        const auto idle = active ? enabledIdle : greyscaleColour(enabledIdle);
+        const auto hot = active ? enabledHot : greyscaleColour(enabledHot);
+        auto colour = idle.interpolatedWith(hot, juce::jlimit(0.0f, 1.0f, highlight));
+        return colour.interpolatedWith(colour.darker(0.35f), juce::jlimit(0.0f, 1.0f, pressedAmt));
+    }
+    juce::Colour disableHandleStrokeColour(bool lowHandle, float highlight, float pressedAmt) const
+    {
+        const bool active = lowHandle ? isDisableLoActive() : isDisableHiActive();
+        const auto enabledIdle = juce::Colour(0xff45aeb1);
+        const auto enabledHot = juce::Colour(0xff9fe3e5);
+        const auto idle = active ? enabledIdle : greyscaleColour(enabledIdle);
+        const auto hot = active ? enabledHot : greyscaleColour(enabledHot);
+        auto colour = idle.interpolatedWith(hot, juce::jlimit(0.0f, 1.0f, highlight));
+        return colour.interpolatedWith(colour.darker(0.25f), juce::jlimit(0.0f, 1.0f, pressedAmt));
+    }
+    static juce::Colour greyscaleColour(juce::Colour c)
+    {
+        return juce::Colour::greyLevel(c.getPerceivedBrightness()).withAlpha(c.getFloatAlpha());
     }
     DisableDragHandle currentHighlightedDisableHandle() const
     {
@@ -787,10 +930,10 @@ private:
         };
         const juce::String loText = typing && selected == Handle::disableLo
                           ? entryBuffer + "_"
-                          : juce::String(dispDisableFreqLoHz(), 1) + " Hz";
+                          : juce::String(getDisableFreqLoHz(), 1) + " Hz";
         const juce::String hiText = typing && selected == Handle::disableHi
                           ? entryBuffer + "_"
-                          : juce::String(dispDisableFreqHiHz(), 1) + " Hz";
+                          : juce::String(dispTargetDisableFreqHiHz(), 1) + " Hz";
         drawChip({ juce::roundToInt(plot.getX()) + pad, y, chipW, chipH },
               loText,
                   juce::Justification::centredLeft);
@@ -899,6 +1042,11 @@ private:
         const auto& range = p->getNormalisableRange();
         const float v = range.snapToLegalValue(realValue);
         p->setValueNotifyingHost(range.convertTo0to1 (v));
+    }
+    static void setToggleParam(juce::RangedAudioParameter* p, bool enabled)
+    {
+        if(p == nullptr) return;
+        p->setValueNotifyingHost(enabled ? 1.0f : 0.0f);
     }
     static void resetParam(juce::RangedAudioParameter* p)
     {
@@ -1009,6 +1157,8 @@ private:
     juce::RangedAudioParameter* spreadParam = nullptr;
     juce::RangedAudioParameter* disableFreqLoParam = nullptr;
     juce::RangedAudioParameter* disableFreqHiParam = nullptr;
+    juce::RangedAudioParameter* disableActiveLoParam = nullptr;
+    juce::RangedAudioParameter* disableActiveHiParam = nullptr;
     juce::RangedAudioParameter* attractionParam = nullptr;
     juce::RangedAudioParameter* bypassParam = nullptr;
     juce::RangedAudioParameter* midiParam = nullptr;
@@ -1051,7 +1201,23 @@ private:
     int disableOverlayToken = 0;
     float disableLoHighlightAmt = 0.0f;
     float disableHiHighlightAmt = 0.0f;
+    float disableLoPressAmt = 0.0f;
+    float disableHiPressAmt = 0.0f;
     bool disableUiEnabled = false;
+    bool currentPressDragged = false;
+    juce::Point<float> pressStartPos;
+    double pressStartTimeMs = 0.0;
+    bool fineControlDrag = false;
+    bool pendingDoubleClick = false;
+    bool pendingDoubleClickOnDisableHandle = false;
+    double lastClickTimeMs = 0.0;
+    juce::Point<float> lastClickPos;
+    static constexpr double customDoubleClickWindowMs = 320.0;
+    static constexpr float fineControlScale = 0.1f;
+    static constexpr float customDoubleClickDistancePx = 16.0f;
+    static constexpr float customDoubleClickTriangleDistancePx = 18.0f;
+    static constexpr float dragStartGracePx = 2.0f;
+    static constexpr float dragStartTriangleGracePx = 2.0f;
     Handle selected = Handle::none;
     bool typing = false;
     juce::String entryBuffer;

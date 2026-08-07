@@ -15,6 +15,18 @@ inline float densityToSalienceThreshold(float density01)
     density01 = density01 + boost * s * (1.0f - density01);
     return 0.9f - density01 * (0.9f - 0.002f);
 }
+enum DisableBypassMask : unsigned char
+{
+    bypassNone = 0,
+    bypassTransient = 1 << 0,
+    bypassDisableLo = 1 << 1,
+    bypassDisableHi = 1 << 2,
+    bypassMuted = 1 << 3
+};
+inline bool isMutedDisableMask(unsigned char mask) noexcept
+{
+    return(mask & bypassMuted) != 0;
+}
 }
 NewProjectAudioProcessor::NewProjectAudioProcessor()
      : AudioProcessor(BusesProperties()
@@ -39,6 +51,8 @@ NewProjectAudioProcessor::NewProjectAudioProcessor()
     envCompParam = apvts.getRawParameterValue("envComp");
     disableFreqLoParam = apvts.getRawParameterValue("disableFreqLo");
     disableFreqHiParam = apvts.getRawParameterValue("disableFreqHi");
+    disableActiveLoParam = apvts.getRawParameterValue("disableActiveLo");
+    disableActiveHiParam = apvts.getRawParameterValue("disableActiveHi");
     centerParam = apvts.getRawParameterValue("detectCenter");
     spreadParam = apvts.getRawParameterValue("detectSpread");
     bypassParam = apvts.getRawParameterValue("pvBypass");
@@ -125,6 +139,10 @@ NewProjectAudioProcessor::createLayout()
         juce::ParameterID { "disableFreqLo", 1 }, "Disable Freq Low", disableFreqRange, 20.0f));
     params.push_back(std::make_unique<juce::AudioParameterFloat>(
         juce::ParameterID { "disableFreqHi", 1 }, "Disable Freq High", disableFreqRange, 20000.0f));
+    params.push_back(std::make_unique<juce::AudioParameterBool>(
+        juce::ParameterID { "disableActiveLo", 1 }, "Disable Active Low", true));
+    params.push_back(std::make_unique<juce::AudioParameterBool>(
+        juce::ParameterID { "disableActiveHi", 1 }, "Disable Active High", true));
     juce::NormalisableRange<float> centerRange { 20.0f, 20000.0f, 0.0f };
     centerRange.setSkewForCentre(640.0f);
     params.push_back(std::make_unique<juce::AudioParameterFloat>(
@@ -144,7 +162,7 @@ NewProjectAudioProcessor::createLayout()
         juce::ParameterID { "hysteresis", 1 }, "Hysteresis", false));
     return { params.begin(), params.end() };
 }
-const juce::String NewProjectAudioProcessor::getName() const { return "NewProject"; }
+const juce::String NewProjectAudioProcessor::getName() const { return "Fluorescence"; }
 bool NewProjectAudioProcessor::acceptsMidi() const { return true; }
 bool NewProjectAudioProcessor::producesMidi() const { return false; }
 bool NewProjectAudioProcessor::isMidiEffect() const { return false; }
@@ -483,6 +501,14 @@ float NewProjectAudioProcessor::effectiveDisableFreqHi() const noexcept
     const float hi = (disableFreqHiParam != nullptr) ? disableFreqHiParam->load() : 20000.0f;
     return juce::jmax(lo, hi);
 }
+bool NewProjectAudioProcessor::isDisableLoActive() const noexcept
+{
+    return disableActiveLoParam == nullptr || disableActiveLoParam->load() >= 0.5f;
+}
+bool NewProjectAudioProcessor::isDisableHiActive() const noexcept
+{
+    return disableActiveHiParam == nullptr || disableActiveHiParam->load() >= 0.5f;
+}
 void NewProjectAudioProcessor::updateTransientBypass(int channel)
 {
     auto& prevMag = prevPvMag[(size_t) channel];
@@ -496,6 +522,8 @@ void NewProjectAudioProcessor::updateTransientBypass(int channel)
     const float unlock = enhance ? 0.0f : juce::jlimit(0.0f, 1.0f, transientParam->load());
     const float disableLo = (disableFreqLoParam != nullptr) ? disableFreqLoParam->load() : 20.0f;
     const float disableHi = effectiveDisableFreqHi();
+    const bool disableLoActive = isDisableLoActive();
+    const bool disableHiActive = isDisableHiActive();
     float thresh = 0.0f;
     if(unlock > 0.0f)
     {
@@ -508,11 +536,36 @@ void NewProjectAudioProcessor::updateTransientBypass(int channel)
     for(int k = 0; k < numBins; ++k)
     {
         const float binHz = (float) k * binWidth;
-        if(binHz < disableLo || binHz > disableHi)
+        if(binHz < disableLo)
         {
-            bypassMask[(size_t) k] = (unsigned char) 1;
-            bypassRe[(size_t) k] = fd[2 * k];
-            bypassIm[(size_t) k] = fd[2 * k + 1];
+            bypassMask[(size_t) k] = (unsigned char) (bypassDisableLo | (disableLoActive ? 0 : bypassMuted));
+            if(disableLoActive)
+            {
+                bypassRe[(size_t) k] = fd[2 * k];
+                bypassIm[(size_t) k] = fd[2 * k + 1];
+            }
+            else
+            {
+                bypassRe[(size_t) k] = 0.0f;
+                bypassIm[(size_t) k] = 0.0f;
+            }
+            pvMag[(size_t) k] = 0.0f;
+            prevMag[(size_t) k] = 0.0f;
+            continue;
+        }
+        if(binHz > disableHi)
+        {
+            bypassMask[(size_t) k] = (unsigned char) (bypassDisableHi | (disableHiActive ? 0 : bypassMuted));
+            if(disableHiActive)
+            {
+                bypassRe[(size_t) k] = fd[2 * k];
+                bypassIm[(size_t) k] = fd[2 * k + 1];
+            }
+            else
+            {
+                bypassRe[(size_t) k] = 0.0f;
+                bypassIm[(size_t) k] = 0.0f;
+            }
             pvMag[(size_t) k] = 0.0f;
             prevMag[(size_t) k] = 0.0f;
             continue;
@@ -521,7 +574,7 @@ void NewProjectAudioProcessor::updateTransientBypass(int channel)
         const float pm = prevMag[(size_t) k];
         if(unlock > 0.0f && pm > 1.0e-9f && m > thresh * pm)
         {
-            bypassMask[(size_t) k] = (unsigned char) 1;
+            bypassMask[(size_t) k] = (unsigned char) bypassTransient;
             bypassRe[(size_t) k] = fd[2 * k];
             bypassIm[(size_t) k] = fd[2 * k + 1];
         }
@@ -2746,7 +2799,22 @@ void NewProjectAudioProcessor::publishSpectrum()
         const auto& bIm = transientBypassIm[0];
         for(int j = 0; j < nb; ++j)
         {
-            if(bMask[(size_t) j] != 0)
+            const unsigned char mask = bMask[(size_t) j];
+            if(isMutedDisableMask(mask))
+            {
+                const float trMag = tsActive ? tsDispMag[(size_t) j] : 0.0f;
+                if(trMag > dstMag[(size_t) j])
+                {
+                    s.mag [(size_t) j] = trMag * spectrumNorm;
+                    s.freq[(size_t) j] = pvFreq[(size_t) j];
+                }
+                else
+                {
+                    s.mag [(size_t) j] = dstMag [(size_t) j] * spectrumNorm;
+                    s.freq[(size_t) j] = dstFreq[(size_t) j];
+                }
+            }
+            else if(mask != 0)
             {
                 const float re = bRe[(size_t) j], im = bIm[(size_t) j];
                 const float bypassMag = std::sqrt(re * re + im * im) * spectrumNorm;
@@ -2795,7 +2863,8 @@ void NewProjectAudioProcessor::publishSpectrum()
                 const int j1 = juce::jmin(nb - 1, (int) std::floor(b + kernelHalf));
                 for(int j = j0; j <= j1; ++j)
                 {
-                    if(transientBypassMask[0][(size_t) j] != 0)
+                    const unsigned char mask = transientBypassMask[0][(size_t) j];
+                    if(mask != 0 && ! isMutedDisableMask(mask))
                         continue;
                     const float tf = ((float) j - b) * (float) kernelOS + (float) centre;
                     const int ti = (int) std::floor(tf);

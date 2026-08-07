@@ -475,9 +475,7 @@ void NewProjectAudioProcessorEditor::handleGlobalMouseMove(const juce::MouseEven
             const auto zone = display.hoverZoneAt(e.getEventRelativeTo(&display).position);
             if(zone == SpectrumDisplay::HoverZone::disableRow)
             {
-                return sidechain
-                         ? "Disabled Bands (Sidechain)\n\nDrag the lower and upper frequency cutoffs to bypass sidechain frequencies outside the kept band.\n\nThe closer handle in the row is the one you adjust."
-                         : "Disabled Bands\n\nDrag the lower and upper frequency cutoffs to bypass frequencies outside the kept band.\n\nThe closer handle in the row is the one you adjust.";
+                return "Disabled Bands\n\nDrag the lower and upper frequency cutoffs to bypass processing to frequencies outside the kept band.\nDouble-Click a triangle to mute or unmute that side band.";
             }
             if(zone == SpectrumDisplay::HoverZone::plot)
             {
@@ -752,8 +750,10 @@ void NewProjectAudioProcessorEditor::resized()
     {
         const int gap = 4;
         const int ovH = 22;
-        spectrumCoordOverlay.setBounds(spectrumBand.getX(), spectrumBand.getBottom() + gap,
-                                        spectrumBand.getWidth(), ovH);
+        const auto plot = spectrum.coordOverlayAnchorBounds();
+        spectrumCoordOverlay.setBounds(spectrumBand.getX() + plot.getX(),
+                                        spectrumBand.getY() + plot.getBottom() + gap,
+                                        plot.getWidth(), ovH);
         spectrumCoordOverlay.toFront(false);
     }
     transposeLbl.setBounds(transposeBand.removeFromBottom(labelH));
@@ -780,7 +780,10 @@ void NewProjectAudioProcessorEditor::resized()
         auto sliderRow = sb.removeFromBottom(sliderRowH);
         scSpectrum.setBounds(sb);
         const int ovGap = 4, ovH = 22;
-        scSpectrumCoordOverlay.setBounds(sb.getX(), sb.getBottom() + ovGap, sb.getWidth(), ovH);
+        const auto scPlot = scSpectrum.coordOverlayAnchorBounds();
+        scSpectrumCoordOverlay.setBounds(sb.getX() + scPlot.getX(),
+                          sb.getY() + scPlot.getBottom() + ovGap,
+                          scPlot.getWidth(), ovH);
         scSpectrumCoordOverlay.toFront(false);
         scTransposeLbl.setBounds(sliderRow.removeFromBottom(labelH));
         scTranspose.setBounds(sliderRow.removeFromTop(juce::jmin(28, sliderRow.getHeight())));
