@@ -33,8 +33,9 @@ private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
     void reconfigure(int newOrder, int newOverlap);
     void processFrame(int channel);
-    void analyze(int channel);
+    float analyze(int channel);
     void processPV(int channel);
+    void updateDetectionFrameParams();
     void detect(int channel);
     float salience(float F, float centsTolerance) const;
     float salienceIdx(int candPeak, int harmHorizon = salienceHarmonics) const;
@@ -61,7 +62,6 @@ private:
     float estimateTimeAdditiveAmplitude(int peakIndex) const;
     bool isTimeAdditiveEnabled() const noexcept;
     float detectTransient(int channel);
-    void updateTransientBypass(int channel);
     void publishSpectrum();
     float destinationFrequency(float sourceFreq, int bin) const;
     float effectiveDisableFreqHi() const noexcept;
@@ -222,8 +222,9 @@ private:
     std::vector<float> dstRetunePeak;
     std::vector<float> feedbackAddedMag;
     std::vector<float> preFeedbackMag;
-    std::vector<float> envRefMag, envRefPrefix, envOutPrefix, envAppliedGain;
+    std::vector<float> envRefPrefix, envOutPrefix, envAppliedGain;
     std::vector<float> fmtRawLog, fmtLog, fmtEnvLog, fmtEnv;
+    std::vector<float> fmtLifterWeight;
     std::array<std::vector<float>, maxChannels> formantGain;
     std::array<std::vector<float>, maxChannels> nextFormantGain;
     std::array<int, maxChannels> formantHopCounter {};
@@ -306,6 +307,7 @@ private:
     void updatePartials(int channel);
     void identifyHarmonic(float freqAnalysis, int& baseIdxOut, int& harmonicOut) const;
     float baseFrequencyForEncodedIndex(int baseIdx) const;
+    void rebuildFlatBaseCandidates();
     float harmonicAssignmentTolerance(int harmonic, float freqHz) const;
     bool findBaseForHarmonic(float partialHz, int harmonic, float preferredBaseHz,
                              int& baseIdxOut, float& baseHzOut, float& deviationCentsOut) const;
@@ -320,6 +322,22 @@ private:
     std::vector<float> invIntTable;
     std::vector<float> log2IntTable;
     std::vector<float> baseLog2Hz;
+    struct FlatBaseCandidate
+    {
+        int encodedIndex = -1;
+        float hz = 0.0f;
+        float log2Hz = 0.0f;
+    };
+    struct RawPeak
+    {
+        int sourceBin = 0;
+        int analysisBin = 0;
+        float hz = 0.0f;
+        float mag = 0.0f;
+        float log2Hz = 0.0f;
+    };
+    std::vector<FlatBaseCandidate> flatBaseCandidates;
+    std::vector<RawPeak> rawPeaks;
     std::vector<float> baseSnapLog2Hz;
     std::vector<float> baseSnapLog2Ratio;
     std::vector<float> binBestDev;
@@ -338,6 +356,27 @@ private:
     std::array<std::array<TrackedBase, maxTracked>, maxChannels> tracked {};
     void updateBaseTracker(int channel, float frameTonal);
     float membershipSigma(int harmonic, float freqHz) const;
+    struct DetectionFrameParams
+    {
+        float emphasis = 0.0f;
+        float attraction = 0.0f;
+        float centsTolerance = centsTol;
+        float tolLoR = 1.0f;
+        float tolHiR = 1.0f;
+        float densityThreshold = 0.0f;
+        float fineCents = 0.0f;
+        float pitchRatio = 1.0f;
+        float fMin = 20.0f;
+        float fMax = 20000.0f;
+        float gatedThreshold = 0.0f;
+        float heldFineSemis = 0.0f;
+        int peakLimit = defaultMaxPeaks;
+        int baseLimit = defaultMaxBases;
+        bool remap = false;
+        bool midiOn = false;
+        std::array<bool, 12> scaleOn {};
+    };
+    DetectionFrameParams detectionFrameParams;
     static constexpr int subBaseBase = 100000;
     std::vector<float> subBaseFreq;
     std::vector<float> subBaseSal;

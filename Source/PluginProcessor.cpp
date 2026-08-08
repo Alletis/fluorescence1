@@ -27,6 +27,12 @@ inline bool isMutedDisableMask(unsigned char mask) noexcept
 {
     return(mask & bypassMuted) != 0;
 }
+inline bool frequenciesWithinRatio(float a, float b, float maxRatio) noexcept
+{
+    const float lo = juce::jmax(1.0e-6f, juce::jmin(a, b));
+    const float hi = juce::jmax(a, b);
+    return hi < maxRatio * lo;
+}
 }
 NewProjectAudioProcessor::NewProjectAudioProcessor()
      : AudioProcessor(BusesProperties()
@@ -105,7 +111,7 @@ NewProjectAudioProcessor::createLayout()
         juce::ParameterID { "enhanceTransient", 1 }, "Enhance Transient", false));
     params.push_back(std::make_unique<juce::AudioParameterFloat>(
         juce::ParameterID { "morph", 1 }, "Morph",
-        juce::NormalisableRange<float> { 0.0f, 1.0f, 0.0f }, 0.0f));
+        juce::NormalisableRange<float> { 0.0f, 1.0f, 0.0f }, 1.0f));
     params.push_back(std::make_unique<juce::AudioParameterChoice>(
         juce::ParameterID { "tonalRenderer", 1 }, "Tonal Renderer",
         juce::StringArray { "Spectral", "Additive" }, 0));
@@ -162,7 +168,7 @@ NewProjectAudioProcessor::createLayout()
         juce::ParameterID { "hysteresis", 1 }, "Hysteresis", false));
     return { params.begin(), params.end() };
 }
-const juce::String NewProjectAudioProcessor::getName() const { return "Fluorescence"; }
+const juce::String NewProjectAudioProcessor::getName() const { return "NewProject"; }
 bool NewProjectAudioProcessor::acceptsMidi() const { return true; }
 bool NewProjectAudioProcessor::producesMidi() const { return false; }
 bool NewProjectAudioProcessor::isMidiEffect() const { return false; }
@@ -223,10 +229,10 @@ void NewProjectAudioProcessor::prepareToPlay(double sr, int)
     accRe.assign(maxBins, 0.0f);
     accIm.assign(maxBins, 0.0f);
     accCov.assign(maxBins, 0.0f);
-    envRefMag.assign(maxBins, 0.0f);
     envRefPrefix.assign(maxBins + 1, 0.0f);
     envOutPrefix.assign(maxBins + 1, 0.0f);
     envAppliedGain.assign(maxBins, 1.0f);
+    fmtLifterWeight.assign(maxFftSize, 0.0f);
     binDestFreq.assign(maxBins, 0.0f);
     binTargetAffinity.assign(maxBins, 0.0f);
     peaks.clear();
@@ -239,6 +245,8 @@ void NewProjectAudioProcessor::prepareToPlay(double sr, int)
     peakTargetAffinity.assign(maxPeaks, 0.0f);
     peakBaseIdx.assign(maxPeaks, -1);
     peakHarmonic.assign(maxPeaks, 0);
+    rawPeaks.clear();
+    rawPeaks.reserve(maxPeaks);
     harmonicMap.assign((size_t) maxDetectionPeaks * maxDetectionPeaks, 0);
     for(auto& v : partials) { v.clear(); v.reserve((size_t) maxPeaks * 2); }
     for(auto& v : timeVoices) { v.clear(); v.reserve((size_t) maxPeaks * 2); }
@@ -405,7 +413,7 @@ void NewProjectAudioProcessor::buildSynthesisKernel()
         synKernelMag[(size_t) t] = std::sqrt(synKernelRe[(size_t) t] * synKernelRe[(size_t) t]
                                            + synKernelIm[(size_t) t] * synKernelIm[(size_t) t]);
 }
-void NewProjectAudioProcessor::analyze(int channel)
+float NewProjectAudioProcessor::analyze(int channel)
 {
     float* fd = fftData.data();
     float* prevPh = prevPhase[(size_t) channel].data();
@@ -430,70 +438,231 @@ void NewProjectAudioProcessor::analyze(int channel)
             pvFreq[(size_t) k] = (float) k * binWidth + dev * freqScale;
             prevPh[k] = pvPhase[(size_t) k];
         }
-        return;
+        return detectTransient(channel);
     }
+    float* prevLog = prevLogMag[(size_t) channel].data();
+    auto& prevMag = prevPvMag[(size_t) channel];
+    auto& bypassRe = transientBypassRe[(size_t) channel];
+    auto& bypassIm = transientBypassIm[(size_t) channel];
+    auto& bypassMask = transientBypassMask[(size_t) channel];
+    const bool transientWasInitialised = transientInit[(size_t) channel];
+    const bool enhance = (enhanceTransientParam != nullptr && enhanceTransientParam->load() >= 0.5f);
+    const float unlock = enhance ? 0.0f : juce::jlimit(0.0f, 1.0f, transientParam->load());
+    const float disableLo = (disableFreqLoParam != nullptr) ? disableFreqLoParam->load() : 20.0f;
+    const float disableHi = effectiveDisableFreqHi();
+    const bool disableLoActive = isDisableLoActive();
+    const bool disableHiActive = isDisableHiActive();
+    float transientBypassThreshold = 0.0f;
+    if(unlock > 0.0f)
+    {
+        const float hopRef = (float) fftSize * 0.25f;
+        const float overlapNorm = (hopSize > 0) ? (hopRef / (float) hopSize) : 1.0f;
+        const float ratioBase = transientBinRatioScale / (unlock * unlock);
+        transientBypassThreshold = 1.0f + (ratioBase - 1.0f) / juce::jmax(1.0f, overlapNorm);
+    }
+    float flux = 0.0f;
     for(int k = 0; k < numBins; ++k)
     {
         const float re = fd[2 * k];
         const float im = fd[2 * k + 1];
         const float ph = fastAtan2 (im, re);
+        const float mag = std::sqrt(re * re + im * im);
         pvPhase[(size_t) k] = ph;
-        pvMag[(size_t) k] = std::sqrt(re * re + im * im);
         const float dev = wrapPhase((ph - prevPh[k]) - expectPerBin * (float) k);
         pvFreq[(size_t) k] = (float) k * binWidth + dev * freqScale;
         prevPh[k] = ph;
+        const float cur = std::log1p(fluxLogScale * std::max(0.0f, mag));
+        if(transientWasInitialised)
+            flux += std::max(0.0f, cur - prevLog[k]);
+        prevLog[k] = cur;
+        unsigned char mask = 0;
+        float finalMag = mag;
+        const float binHz = (float) k * binWidth;
+        if(binHz < disableLo)
+        {
+            mask = (unsigned char) (bypassDisableLo | (disableLoActive ? 0 : bypassMuted));
+            if(disableLoActive)
+            {
+                bypassRe[(size_t) k] = re;
+                bypassIm[(size_t) k] = im;
+            }
+            finalMag = 0.0f;
+            prevMag[(size_t) k] = 0.0f;
+        }
+        else if(binHz > disableHi)
+        {
+            mask = (unsigned char) (bypassDisableHi | (disableHiActive ? 0 : bypassMuted));
+            if(disableHiActive)
+            {
+                bypassRe[(size_t) k] = re;
+                bypassIm[(size_t) k] = im;
+            }
+            finalMag = 0.0f;
+            prevMag[(size_t) k] = 0.0f;
+        }
+        else
+        {
+            const float pm = prevMag[(size_t) k];
+            if(unlock > 0.0f && pm > 1.0e-9f && mag > transientBypassThreshold * pm)
+            {
+                mask = (unsigned char) bypassTransient;
+                bypassRe[(size_t) k] = re;
+                bypassIm[(size_t) k] = im;
+            }
+            prevMag[(size_t) k] = mag;
+        }
+        bypassMask[(size_t) k] = mask;
+        pvMag[(size_t) k] = finalMag;
     }
-}
-float NewProjectAudioProcessor::detectTransient(int channel)
-{
-    float* prevLog = prevLogMag[(size_t) channel].data();
-    if(! transientInit[(size_t) channel])
+    if(! transientWasInitialised)
     {
-        for(int k = 0; k < numBins; ++k)
-            prevLog[k] = std::log1p(fluxLogScale * std::max(0.0f, pvMag[(size_t) k]));
         fluxBaseline[(size_t) channel] = 0.0f;
         heldStrength[(size_t) channel] = 0.0f;
         holdRemaining[(size_t) channel] = 0;
         transientInit[(size_t) channel] = true;
         return 0.0f;
     }
+    flux /= (float) numBins;
+    {
+        const float hopRef = (float) fftSize * 0.25f;
+        const float overlapNorm = (hopSize > 0) ? (hopRef / (float) hopSize) : 1.0f;
+        flux *= overlapNorm;
+        const float baseAlpha = juce::jlimit(0.0f, 1.0f, fluxBaselineAlpha / overlapNorm);
+        const int holdFrames = juce::jmax(1, (int) std::lround((float) fluxHoldFrames * overlapNorm));
+        const float holdDecay = std::pow(fluxHoldDecay, 1.0f / juce::jmax(1.0f, overlapNorm));
+        const float threshold = std::max(fluxThresholdFloor,
+                                          fluxBaseline[(size_t) channel] * fluxThresholdMult);
+        float strength = 0.0f;
+        if(flux > threshold)
+        {
+            const float denom = std::max(threshold + fluxThresholdFloor, 1.0e-6f);
+            strength = juce::jlimit(0.0f, 1.0f, (flux - threshold) / denom);
+            heldStrength[(size_t) channel] = strength;
+            holdRemaining[(size_t) channel] = holdFrames;
+        }
+        else if(holdRemaining[(size_t) channel] > 0)
+        {
+            heldStrength[(size_t) channel] *= holdDecay;
+            --holdRemaining[(size_t) channel];
+        }
+        else
+        {
+            heldStrength[(size_t) channel] = 0.0f;
+        }
+        const float result = juce::jlimit(0.0f, 1.0f,
+                                           std::max(strength, heldStrength[(size_t) channel]));
+        fluxBaseline[(size_t) channel] += baseAlpha * (flux - fluxBaseline[(size_t) channel]);
+        return result;
+    }
+}
+float NewProjectAudioProcessor::detectTransient(int channel)
+{
+    float* prevLog = prevLogMag[(size_t) channel].data();
+    auto& prevMag = prevPvMag[(size_t) channel];
+    auto& bypassRe = transientBypassRe[(size_t) channel];
+    auto& bypassIm = transientBypassIm[(size_t) channel];
+    auto& bypassMask = transientBypassMask[(size_t) channel];
+    const bool transientWasInitialised = transientInit[(size_t) channel];
+    const bool enhance = (enhanceTransientParam != nullptr && enhanceTransientParam->load() >= 0.5f);
+    const float unlock = enhance ? 0.0f : juce::jlimit(0.0f, 1.0f, transientParam->load());
+    const float disableLo = (disableFreqLoParam != nullptr) ? disableFreqLoParam->load() : 20.0f;
+    const float disableHi = effectiveDisableFreqHi();
+    const bool disableLoActive = isDisableLoActive();
+    const bool disableHiActive = isDisableHiActive();
+    float transientBypassThreshold = 0.0f;
+    if(unlock > 0.0f)
+    {
+        const float hopRef = (float) fftSize * 0.25f;
+        const float overlapNorm = (hopSize > 0) ? (hopRef / (float) hopSize) : 1.0f;
+        const float ratioBase = transientBinRatioScale / (unlock * unlock);
+        transientBypassThreshold = 1.0f + (ratioBase - 1.0f) / juce::jmax(1.0f, overlapNorm);
+    }
+    float* fd = fftData.data();
     float flux = 0.0f;
     for(int k = 0; k < numBins; ++k)
     {
-        const float cur = std::log1p(fluxLogScale * std::max(0.0f, pvMag[(size_t) k]));
-        flux += std::max(0.0f, cur - prevLog[k]);
+        const float m = pvMag[(size_t) k];
+        const float cur = std::log1p(fluxLogScale * std::max(0.0f, m));
+        if(transientWasInitialised)
+            flux += std::max(0.0f, cur - prevLog[k]);
         prevLog[(size_t) k] = cur;
+        unsigned char mask = 0;
+        const float binHz = (float) k * binWidth;
+        if(binHz < disableLo)
+        {
+            mask = (unsigned char) (bypassDisableLo | (disableLoActive ? 0 : bypassMuted));
+            if(disableLoActive)
+            {
+                bypassRe[(size_t) k] = fd[2 * k];
+                bypassIm[(size_t) k] = fd[2 * k + 1];
+            }
+            pvMag[(size_t) k] = 0.0f;
+            prevMag[(size_t) k] = 0.0f;
+        }
+        else if(binHz > disableHi)
+        {
+            mask = (unsigned char) (bypassDisableHi | (disableHiActive ? 0 : bypassMuted));
+            if(disableHiActive)
+            {
+                bypassRe[(size_t) k] = fd[2 * k];
+                bypassIm[(size_t) k] = fd[2 * k + 1];
+            }
+            pvMag[(size_t) k] = 0.0f;
+            prevMag[(size_t) k] = 0.0f;
+        }
+        else
+        {
+            const float pm = prevMag[(size_t) k];
+            if(unlock > 0.0f && pm > 1.0e-9f && m > transientBypassThreshold * pm)
+            {
+                mask = (unsigned char) bypassTransient;
+                bypassRe[(size_t) k] = fd[2 * k];
+                bypassIm[(size_t) k] = fd[2 * k + 1];
+            }
+            prevMag[(size_t) k] = m;
+        }
+        bypassMask[(size_t) k] = mask;
+    }
+    if(! transientWasInitialised)
+    {
+        fluxBaseline[(size_t) channel] = 0.0f;
+        heldStrength[(size_t) channel] = 0.0f;
+        holdRemaining[(size_t) channel] = 0;
+        transientInit[(size_t) channel] = true;
+        return 0.0f;
     }
     flux /= (float) numBins;
-    const float hopRef = (float) fftSize * 0.25f;
-    const float overlapNorm = (hopSize > 0) ? (hopRef / (float) hopSize) : 1.0f;
-    flux *= overlapNorm;
-    const float baseAlpha = juce::jlimit(0.0f, 1.0f, fluxBaselineAlpha / overlapNorm);
-    const int holdFrames = juce::jmax(1, (int) std::lround((float) fluxHoldFrames * overlapNorm));
-    const float holdDecay = std::pow(fluxHoldDecay, 1.0f / juce::jmax(1.0f, overlapNorm));
-    const float threshold = std::max(fluxThresholdFloor,
-                                      fluxBaseline[(size_t) channel] * fluxThresholdMult);
-    float strength = 0.0f;
-    if(flux > threshold)
     {
-        const float denom = std::max(threshold + fluxThresholdFloor, 1.0e-6f);
-        strength = juce::jlimit(0.0f, 1.0f, (flux - threshold) / denom);
-        heldStrength[(size_t) channel] = strength;
-        holdRemaining[(size_t) channel] = holdFrames;
+        const float hopRef = (float) fftSize * 0.25f;
+        const float overlapNorm = (hopSize > 0) ? (hopRef / (float) hopSize) : 1.0f;
+        flux *= overlapNorm;
+        const float baseAlpha = juce::jlimit(0.0f, 1.0f, fluxBaselineAlpha / overlapNorm);
+        const int holdFrames = juce::jmax(1, (int) std::lround((float) fluxHoldFrames * overlapNorm));
+        const float holdDecay = std::pow(fluxHoldDecay, 1.0f / juce::jmax(1.0f, overlapNorm));
+        const float threshold = std::max(fluxThresholdFloor,
+                                          fluxBaseline[(size_t) channel] * fluxThresholdMult);
+        float strength = 0.0f;
+        if(flux > threshold)
+        {
+            const float denom = std::max(threshold + fluxThresholdFloor, 1.0e-6f);
+            strength = juce::jlimit(0.0f, 1.0f, (flux - threshold) / denom);
+            heldStrength[(size_t) channel] = strength;
+            holdRemaining[(size_t) channel] = holdFrames;
+        }
+        else if(holdRemaining[(size_t) channel] > 0)
+        {
+            heldStrength[(size_t) channel] *= holdDecay;
+            --holdRemaining[(size_t) channel];
+        }
+        else
+        {
+            heldStrength[(size_t) channel] = 0.0f;
+        }
+        const float result = juce::jlimit(0.0f, 1.0f,
+                                           std::max(strength, heldStrength[(size_t) channel]));
+        fluxBaseline[(size_t) channel] += baseAlpha * (flux - fluxBaseline[(size_t) channel]);
+        return result;
     }
-    else if(holdRemaining[(size_t) channel] > 0)
-    {
-        heldStrength[(size_t) channel] *= holdDecay;
-        --holdRemaining[(size_t) channel];
-    }
-    else
-    {
-        heldStrength[(size_t) channel] = 0.0f;
-    }
-    const float result = juce::jlimit(0.0f, 1.0f,
-                                       std::max(strength, heldStrength[(size_t) channel]));
-    fluxBaseline[(size_t) channel] += baseAlpha * (flux - fluxBaseline[(size_t) channel]);
-    return result;
 }
 float NewProjectAudioProcessor::effectiveDisableFreqHi() const noexcept
 {
@@ -509,83 +678,16 @@ bool NewProjectAudioProcessor::isDisableHiActive() const noexcept
 {
     return disableActiveHiParam == nullptr || disableActiveHiParam->load() >= 0.5f;
 }
-void NewProjectAudioProcessor::updateTransientBypass(int channel)
-{
-    auto& prevMag = prevPvMag[(size_t) channel];
-    auto& bypassRe = transientBypassRe[(size_t) channel];
-    auto& bypassIm = transientBypassIm[(size_t) channel];
-    auto& bypassMask = transientBypassMask[(size_t) channel];
-    std::fill(bypassRe.begin(), bypassRe.begin() + numBins, 0.0f);
-    std::fill(bypassIm.begin(), bypassIm.begin() + numBins, 0.0f);
-    std::fill(bypassMask.begin(), bypassMask.begin() + numBins, (unsigned char) 0);
-    const bool enhance = (enhanceTransientParam != nullptr && enhanceTransientParam->load() >= 0.5f);
-    const float unlock = enhance ? 0.0f : juce::jlimit(0.0f, 1.0f, transientParam->load());
-    const float disableLo = (disableFreqLoParam != nullptr) ? disableFreqLoParam->load() : 20.0f;
-    const float disableHi = effectiveDisableFreqHi();
-    const bool disableLoActive = isDisableLoActive();
-    const bool disableHiActive = isDisableHiActive();
-    float thresh = 0.0f;
-    if(unlock > 0.0f)
-    {
-        const float hopRef = (float) fftSize * 0.25f;
-        const float overlapNorm = (hopSize > 0) ? (hopRef / (float) hopSize) : 1.0f;
-        const float ratioBase = transientBinRatioScale / (unlock * unlock);
-        thresh = 1.0f + (ratioBase - 1.0f) / juce::jmax(1.0f, overlapNorm);
-    }
-    float* fd = fftData.data();
-    for(int k = 0; k < numBins; ++k)
-    {
-        const float binHz = (float) k * binWidth;
-        if(binHz < disableLo)
-        {
-            bypassMask[(size_t) k] = (unsigned char) (bypassDisableLo | (disableLoActive ? 0 : bypassMuted));
-            if(disableLoActive)
-            {
-                bypassRe[(size_t) k] = fd[2 * k];
-                bypassIm[(size_t) k] = fd[2 * k + 1];
-            }
-            else
-            {
-                bypassRe[(size_t) k] = 0.0f;
-                bypassIm[(size_t) k] = 0.0f;
-            }
-            pvMag[(size_t) k] = 0.0f;
-            prevMag[(size_t) k] = 0.0f;
-            continue;
-        }
-        if(binHz > disableHi)
-        {
-            bypassMask[(size_t) k] = (unsigned char) (bypassDisableHi | (disableHiActive ? 0 : bypassMuted));
-            if(disableHiActive)
-            {
-                bypassRe[(size_t) k] = fd[2 * k];
-                bypassIm[(size_t) k] = fd[2 * k + 1];
-            }
-            else
-            {
-                bypassRe[(size_t) k] = 0.0f;
-                bypassIm[(size_t) k] = 0.0f;
-            }
-            pvMag[(size_t) k] = 0.0f;
-            prevMag[(size_t) k] = 0.0f;
-            continue;
-        }
-        const float m = pvMag[(size_t) k];
-        const float pm = prevMag[(size_t) k];
-        if(unlock > 0.0f && pm > 1.0e-9f && m > thresh * pm)
-        {
-            bypassMask[(size_t) k] = (unsigned char) bypassTransient;
-            bypassRe[(size_t) k] = fd[2 * k];
-            bypassIm[(size_t) k] = fd[2 * k + 1];
-        }
-        prevMag[(size_t) k] = m;
-    }
-}
 void NewProjectAudioProcessor::applyFormantShift(int channel)
 {
     const float semis = (formantParam != nullptr) ? formantParam->load() : 0.0f;
+    if(std::abs(semis) < 1.0e-4f)
+    {
+        formantRatio = 1.0f;
+        formantGainValid[(size_t) channel] = false;
+        return;
+    }
     formantRatio = std::pow(2.0f, semis / 12.0f);
-    if(std::abs(semis) < 1.0e-4f) { formantGainValid[(size_t) channel] = false; return; }
     auto& gain = formantGain[(size_t) channel];
     auto& nextGain = nextFormantGain[(size_t) channel];
     const int overlap = (hopSize > 0) ? (fftSize / hopSize) : 4;
@@ -637,23 +739,24 @@ void NewProjectAudioProcessor::applyFormantShift(int channel)
                        : (int) std::lround((float) sampleRate / formantDefaultDetailHz);
         Q = juce::jlimit(12, N / 4, Q);
         const int Qpass = std::max(6, (int) std::round((float) Q * 0.7f));
-        auto softLifter = [&]()
+        for(int n = 0; n < N; ++n)
         {
-            for(int n = 0; n < N; ++n)
+            const int q = std::min(n, N - n);
+            float w;
+            if(q <= Qpass) w = 1.0f;
+            else if(q >= Q) w = 0.0f;
+            else
             {
-                const int q = std::min(n, N - n);
-                float w;
-                if(q <= Qpass) w = 1.0f;
-                else if(q >= Q) w = 0.0f;
-                else { const float tt = (float)(q - Qpass) / (float)(Q - Qpass);
-                       w = 0.5f * (1.0f + std::cos(juce::MathConstants<float>::pi * tt)); }
-                fmtCepOut[(size_t) n] *= w;
+                const float tt = (float) (q - Qpass) / (float) (Q - Qpass);
+                w = 0.5f * (1.0f + std::cos(juce::MathConstants<float>::pi * tt));
             }
-        };
+            fmtLifterWeight[(size_t) n] = w;
+        }
         for(int it = 0; it < formantEnvIters; ++it)
         {
             if(it > 0) buildCepstrum();
-            softLifter();
+            for(int n = 0; n < N; ++n)
+                fmtCepOut[(size_t) n] *= fmtLifterWeight[(size_t) n];
             fft->perform(fmtCepOut.data(), fmtCepIn.data(), false);
             float correction = 0.0f;
             for(int k = 0; k < numBins; ++k)
@@ -848,7 +951,9 @@ float NewProjectAudioProcessor::snapBaseToScale(float baseHz, float amount, floa
 float NewProjectAudioProcessor::membershipSigma(int harmonic, float freqHz) const
 {
     const int n = juce::jmax(1, harmonic);
-    const float gapCents = 1200.0f * std::log2 ((float)(n + 1) / (float) n);
+    const float gapCents = (n <= harmonicsTagMax)
+        ? gapCentsTable[(size_t) n]
+        : 1200.0f * std::log2((float) (n + 1) / (float) n);
     const float f = juce::jmax(1.0f, freqHz);
     const float resFloor = 1200.0f * std::log2 (1.0f + binWidth / f);
     const float lo = juce::jmax(5.0f, resFloor);
@@ -880,12 +985,29 @@ void NewProjectAudioProcessor::updateBaseTracker(int channel, float frameTonal)
     std::array<bool, maxTracked> trkMatched {};
     std::array<bool, maxBases> candMatched {};
     std::array<float, maxBases> candFreq {};
+    std::array<float, maxBases> candLog2Hz {};
     std::array<float, maxBases> candDispConf {};
+    std::array<int, maxTracked> activeTracks {};
+    std::array<float, maxTracked> activeTrackLog2Hz {};
+    std::array<int, maxTracked> freeTracks {};
+    int numActiveTracks = 0;
+    int numFreeTracks = 0;
+    for(int k = 0; k < maxTracked; ++k)
+    {
+        if(T[(size_t) k].active)
+        {
+            activeTracks[(size_t) numActiveTracks++] = k;
+            activeTrackLog2Hz[(size_t) k] = std::log2(juce::jmax(1.0e-6f, T[(size_t) k].freq));
+        }
+        else
+            freeTracks[(size_t) numFreeTracks++] = k;
+    }
     const int nCand = juce::jmin(numBases, (int) maxBases);
     const float candRef = (nCand > 0) ? baseSal[0] : 0.0f;
     for(int c = 0; c < nCand; ++c)
     {
         candFreq[(size_t) c] = baseFreq[(size_t) c];
+        candLog2Hz[(size_t) c] = std::log2(juce::jmax(1.0e-6f, candFreq[(size_t) c]));
         const float rel = (candRef > 0.0f) ? juce::jlimit(0.0f, 1.0f, baseSal[(size_t) c] / candRef) : 0.0f;
         candDispConf[(size_t) c] = rel * frameTonal;
     }
@@ -897,32 +1019,41 @@ void NewProjectAudioProcessor::updateBaseTracker(int channel, float frameTonal)
     };
     std::array<BaseMatchCand, (size_t) maxTracked * (size_t) maxBases> baseMatchCands {};
     int numBaseMatchCands = 0;
-    for(int c = 0; c < nCand; ++c)
+    if(numActiveTracks > 0)
     {
-        const float fc = candFreq[(size_t) c];
-        if(fc <= 0.0f)
+        for(int c = 0; c < nCand; ++c)
         {
-            candMatched[(size_t) c] = true;
-            continue;
-        }
-        for(int k = 0; k < maxTracked; ++k)
-        {
-            if(! T[(size_t) k].active)
+            const float fc = candFreq[(size_t) c];
+            if(fc <= 0.0f)
+            {
+                candMatched[(size_t) c] = true;
                 continue;
-            const float tf = juce::jmax(1.0e-6f, T[(size_t) k].freq);
-            const float devCents = std::abs(1200.0f * std::log2(fc / tf));
-            auto& m = baseMatchCands[(size_t) numBaseMatchCands++];
-            m.distanceCents = devCents;
-            m.track = k;
-            m.candidate = c;
+            }
+            for(int activeIndex = 0; activeIndex < numActiveTracks; ++activeIndex)
+            {
+                const int k = activeTracks[(size_t) activeIndex];
+                const float devCents = 1200.0f * std::abs(candLog2Hz[(size_t) c]
+                                                        - activeTrackLog2Hz[(size_t) k]);
+                auto& m = baseMatchCands[(size_t) numBaseMatchCands++];
+                m.distanceCents = devCents;
+                m.track = k;
+                m.candidate = c;
+            }
         }
+        if(numBaseMatchCands > 1)
+            std::sort(baseMatchCands.begin(),
+                      baseMatchCands.begin() + numBaseMatchCands,
+                      [] (const BaseMatchCand& a, const BaseMatchCand& b)
+                      {
+                          return a.distanceCents < b.distanceCents;
+                      });
     }
-    std::sort(baseMatchCands.begin(),
-              baseMatchCands.begin() + numBaseMatchCands,
-              [] (const BaseMatchCand& a, const BaseMatchCand& b)
-              {
-                  return a.distanceCents < b.distanceCents;
-              });
+    else
+    {
+        for(int c = 0; c < nCand; ++c)
+            if(candFreq[(size_t) c] <= 0.0f)
+                candMatched[(size_t) c] = true;
+    }
     for(int mi = 0; mi < numBaseMatchCands; ++mi)
     {
         const auto& m = baseMatchCands[(size_t) mi];
@@ -982,14 +1113,14 @@ void NewProjectAudioProcessor::updateBaseTracker(int channel, float frameTonal)
             }
         }
     }
+    int nextFreeTrack = 0;
     for(int c = 0; c < nCand; ++c)
     {
         if(candMatched[(size_t) c]) continue;
         const float fc = candFreq[(size_t) c];
         if(fc <= 0.0f) continue;
-        int slot = -1;
-        for(int k = 0; k < maxTracked; ++k) if(! T[(size_t) k].active) { slot = k; break; }
-        if(slot < 0) continue;
+        if(nextFreeTrack >= numFreeTracks) continue;
+        const int slot = freeTracks[(size_t) nextFreeTrack++];
         auto& t = T[(size_t) slot]; t = TrackedBase{};
         t.active = true; t.freq = fc; t.conf = claimRise; t.age = 1;
         t.sal = candDispConf[(size_t) c];
@@ -1045,10 +1176,12 @@ void NewProjectAudioProcessor::updateBaseTracker(int channel, float frameTonal)
         order[(size_t)(b + 1)] = key;
     }
     int out = 0;
+    std::array<float, maxBases> outLog2Hz {};
     for(int oi = 0; oi < nOrder && out < outLimit; ++oi)
     {
         const int k = order[(size_t) oi];
         baseFreq[(size_t) out] = T[(size_t) k].freq;
+        outLog2Hz[(size_t) out] = std::log2(juce::jmax(1.0e-6f, baseFreq[(size_t) out]));
         baseSal [(size_t) out] = juce::jmax(0.0f, T[(size_t) k].sal);
         baseTargetMidi[(size_t) out] = T[(size_t) k].heldTargetMidi;
         ++out;
@@ -1057,11 +1190,13 @@ void NewProjectAudioProcessor::updateBaseTracker(int channel, float frameTonal)
     {
         const float fc = candFreq[(size_t) c];
         if(fc <= 0.0f) continue;
+        const float fcLog2 = candLog2Hz[(size_t) c];
         bool near = false;
         for(int oi = 0; oi < out; ++oi)
-            if(std::abs(1200.0f * std::log2 (fc / juce::jmax(1.0e-6f, baseFreq[(size_t) oi]))) < dedupeTolCents)
+            if(1200.0f * std::abs(fcLog2 - outLog2Hz[(size_t) oi]) < dedupeTolCents)
             { near = true; break; }
-        if(! near) { baseFreq[(size_t) out] = fc; baseSal[(size_t) out] = candDispConf[(size_t) c];
+        if(! near) { baseFreq[(size_t) out] = fc; outLog2Hz[(size_t) out] = fcLog2;
+                      baseSal[(size_t) out] = candDispConf[(size_t) c];
                       baseTargetMidi[(size_t) out] = -1000.0f; ++out; }
     }
     numBases = out;
@@ -1086,9 +1221,8 @@ bool NewProjectAudioProcessor::resolvePeakObservation(int channel, int sourceBin
             if(partial.dying != 0 || partial.freqNat <= 0.0f)
                 continue;
             const float distanceHz = std::abs(partial.freqNat - peakHz);
-            const float ratio = juce::jmax(partial.freqNat, peakHz)
-                              / juce::jmax(1.0e-6f, juce::jmin(partial.freqNat, peakHz));
-            if(distanceHz <= anchorRadiusHz && ratio < 1.9f
+            if(distanceHz <= anchorRadiusHz
+               && frequenciesWithinRatio(partial.freqNat, peakHz, 1.9f)
                && distanceHz < anchorDistance)
             {
                 anchorDistance = distanceHz;
@@ -1099,9 +1233,8 @@ bool NewProjectAudioProcessor::resolvePeakObservation(int channel, int sourceBin
         {
             const float prior = prevPrimary[(size_t) channel];
             const float distanceHz = std::abs(prior - peakHz);
-            const float ratio = juce::jmax(prior, peakHz)
-                              / juce::jmax(1.0e-6f, juce::jmin(prior, peakHz));
-            if(distanceHz <= anchorRadiusHz && ratio < 1.9f)
+            if(distanceHz <= anchorRadiusHz
+               && frequenciesWithinRatio(prior, peakHz, 1.9f))
                 anchorHz = prior;
         }
         if(anchorHz > 0.0f)
@@ -1118,9 +1251,8 @@ bool NewProjectAudioProcessor::resolvePeakObservation(int channel, int sourceBin
                 if(!std::isfinite(candidateHz) || candidateHz <= 0.0f)
                     continue;
                 const float distanceHz = std::abs(candidateHz - anchorHz);
-                const float ratio = juce::jmax(candidateHz, anchorHz)
-                                  / juce::jmax(1.0e-6f, juce::jmin(candidateHz, anchorHz));
-                if(distanceHz <= anchorRadiusHz && ratio < 1.9f
+                     if(distanceHz <= anchorRadiusHz
+                         && frequenciesWithinRatio(candidateHz, anchorHz, 1.9f)
                    && distanceHz < bestDistance)
                 {
                     bestDistance = distanceHz;
@@ -1138,19 +1270,23 @@ void NewProjectAudioProcessor::rebuildHarmonicPeakList(int channel, float frameM
     const float transformedBinWidth = juce::jmax(1.0e-6f, binWidth * pitchRatio);
     const float harmonicFloor = juce::jmax(1.0e-12f,
                                             frameMaxMag * partialPeakFloorRel);
+    const bool hysteresisOn =
+        (hysteresisParam != nullptr && hysteresisParam->load() >= 0.5f);
+    const auto& heldPartials = partials[(size_t) channel];
+    const bool usePeakHysteresis = hysteresisOn && ! heldPartials.empty();
+    const float heldMatchLoR = std::exp2(-partialMatchTolCents / 1200.0f);
+    const float heldMatchHiR = std::exp2( partialMatchTolCents / 1200.0f);
+    const float heldMatchResolutionHz = 0.65f * transformedBinWidth;
     numPeaks = 0;
-    for(int sourceBin = 1; sourceBin + 1 < numBins && numPeaks < maxPeaks; ++sourceBin)
+    for(const auto& rawPeak : rawPeaks)
     {
-        const float localMagnitude = pvMag[(size_t) sourceBin];
-        if(!(localMagnitude > harmonicFloor
-             && localMagnitude > pvMag[(size_t) (sourceBin - 1)]
-             && localMagnitude >= pvMag[(size_t) (sourceBin + 1)]))
+        if(numPeaks >= maxPeaks)
             continue;
-        int analysisBin = sourceBin;
-        float peakHz = 0.0f;
-        if(!resolvePeakObservation(channel, sourceBin, analysisBin, peakHz))
-            continue;
-        const float magnitude = pvMag[(size_t) analysisBin];
+        const int sourceBin = rawPeak.sourceBin;
+        const int analysisBin = rawPeak.analysisBin;
+        const float peakHz = rawPeak.hz;
+        const float peakLog2 = rawPeak.log2Hz;
+        const float magnitude = rawPeak.mag;
         if(magnitude <= harmonicFloor)
             continue;
         int duplicatePeak = -1;
@@ -1174,7 +1310,7 @@ void NewProjectAudioProcessor::rebuildHarmonicPeakList(int channel, float frameM
         int bestBase = -1;
         int bestHarmonic = 0;
         float bestDeviation = 1.0e30f;
-        auto considerBase = [&] (int encodedBase, float baseHz)
+        auto considerBase = [&] (int encodedBase, float baseHz, float baseLog2)
         {
             if(baseHz <= 0.0f)
                 return;
@@ -1183,8 +1319,10 @@ void NewProjectAudioProcessor::rebuildHarmonicPeakList(int channel, float frameM
             const float idealHz = (float) harmonic * baseHz;
             if(idealHz <= 0.0f || idealHz >= nyquist)
                 return;
-            const float deviation = std::abs(
-                1200.0f * std::log2(peakHz / idealHz));
+            const float harmonicLog2 = (harmonic <= harmonicsTagMax)
+                ? log2IntTable[(size_t) harmonic]
+                : std::log2((float) harmonic);
+            const float deviation = 1200.0f * std::abs(peakLog2 - harmonicLog2 - baseLog2);
             const float tolerance = membershipSigma(harmonic, peakHz);
             if(deviation <= tolerance && deviation < bestDeviation)
             {
@@ -1193,12 +1331,133 @@ void NewProjectAudioProcessor::rebuildHarmonicPeakList(int channel, float frameM
                 bestHarmonic = harmonic;
             }
         };
-        for(int base = 0; base < numBases; ++base)
-            considerBase(base, baseFreq[(size_t) base]);
-        for(int base = 0; base < subNumBases; ++base)
-            considerBase(subBaseBase + base, subBaseFreq[(size_t) base]);
-        for(int base = 0; base < hiNumBases; ++base)
-            considerBase(hiBaseBase + base, hiBaseFreq[(size_t) base]);
+        for(const auto& base : flatBaseCandidates)
+            considerBase(base.encodedIndex, base.hz, base.log2Hz);
+        if(usePeakHysteresis)
+        {
+            const Partial* heldPartial = nullptr;
+            float bestHeldMatchCents = 1.0e9f;
+            const float heldMatchLoHz = peakHz * heldMatchLoR;
+            const float heldMatchHiHz = peakHz * heldMatchHiR;
+            for(const auto& partial : heldPartials)
+            {
+                const float partialHz = partial.freqNat;
+                if(partial.harmonic < 1 || partialHz <= 0.0f)
+                    continue;
+                const float distanceHz = std::abs(peakHz - partialHz);
+                const bool nearCents = partialHz > heldMatchLoHz && partialHz < heldMatchHiHz;
+                const bool nearResolution = distanceHz <= heldMatchResolutionHz
+                                         && juce::jmax(peakHz, partialHz)
+                                                < 1.5f * juce::jmax(1.0e-6f, juce::jmin(peakHz, partialHz));
+                if(! (nearCents || distanceHz <= partialMatchTolHz || nearResolution))
+                    continue;
+                const float partialLog2 = std::log2(partialHz);
+                const float matchCents = std::abs(1200.0f * (peakLog2 - partialLog2));
+                if(matchCents < bestHeldMatchCents)
+                {
+                    bestHeldMatchCents = matchCents;
+                    heldPartial = &partial;
+                }
+            }
+            if(heldPartial != nullptr)
+            {
+                const int heldHarmonic = juce::jmax(1, heldPartial->harmonic);
+                const float heldHarmonicLog2 = (heldHarmonic <= harmonicsTagMax)
+                    ? log2IntTable[(size_t) heldHarmonic]
+                    : std::log2((float) heldHarmonic);
+                const float preferredBaseHz = (heldPartial->harmonicBaseHz > 0.0f)
+                    ? heldPartial->harmonicBaseHz
+                    : heldPartial->freqNat / (float) heldHarmonic;
+                const float preferredBaseLog2 = (preferredBaseHz > 0.0f)
+                    ? std::log2(preferredBaseHz)
+                    : 0.0f;
+                const float candidateBaseHz =
+                    (bestBase >= 0 && bestHarmonic >= 1)
+                        ? baseFrequencyForEncodedIndex(bestBase)
+                        : 0.0f;
+                const float candidateBaseLog2 = (candidateBaseHz > 0.0f)
+                    ? std::log2(candidateBaseHz)
+                    : 0.0f;
+                const bool candidateMatchesHeldIdentity =
+                    bestHarmonic == heldHarmonic
+                    && candidateBaseHz > 0.0f
+                    && preferredBaseHz > 0.0f
+                    && std::abs(1200.0f * (candidateBaseLog2 - preferredBaseLog2))
+                        < basePhaseMatchCents;
+                if(candidateMatchesHeldIdentity)
+                    goto peakHysteresisResolved;
+                int heldBase = -1;
+                float heldBaseHz = 0.0f;
+                float heldDeviation = 1.0e9f;
+                const bool heldFound = findBaseForHarmonic(peakHz, heldHarmonic,
+                                                           preferredBaseHz, heldBase,
+                                                           heldBaseHz, heldDeviation);
+                const float heldGap = (heldHarmonic <= harmonicsTagMax)
+                    ? gapCentsTable[(size_t) heldHarmonic]
+                    : 1200.0f * std::log2((float) (heldHarmonic + 1)
+                                        / (float) heldHarmonic);
+                const float heldTolerance = harmonicAssignmentTolerance(heldHarmonic, peakHz);
+                const float heldReleaseTolerance = heldTolerance + 0.10f * heldGap;
+                const bool heldValid = heldFound && heldDeviation <= heldReleaseTolerance;
+                if(heldValid)
+                {
+                    if(bestBase < 0 || bestHarmonic < 1)
+                    {
+                        bestBase = heldBase;
+                        bestHarmonic = heldHarmonic;
+                        bestDeviation = heldDeviation;
+                    }
+                    else
+                    {
+                        const float heldBaseLog2 = (heldBaseHz > 0.0f)
+                            ? std::log2(heldBaseHz)
+                            : 0.0f;
+                        const float baseSeparation = (candidateBaseHz > 0.0f && heldBaseHz > 0.0f)
+                            ? std::abs(1200.0f * (candidateBaseLog2 - heldBaseLog2))
+                            : 1.0e9f;
+                        const bool sameIdentity = bestHarmonic == heldHarmonic
+                                               && baseSeparation < basePhaseMatchCents;
+                        if(sameIdentity)
+                        {
+                            bestBase = heldBase;
+                            bestHarmonic = heldHarmonic;
+                            bestDeviation = heldDeviation;
+                        }
+                        else
+                        {
+                            const float heldIdeal = (float) heldHarmonic * heldBaseHz;
+                            const float candidateIdeal = (float) bestHarmonic * candidateBaseHz;
+                            if(heldIdeal > 0.0f && candidateIdeal > 0.0f)
+                            {
+                                const float candidateHarmonicLog2 = (bestHarmonic <= harmonicsTagMax)
+                                    ? log2IntTable[(size_t) bestHarmonic]
+                                    : std::log2((float) bestHarmonic);
+                                const float heldLog = heldHarmonicLog2 + heldBaseLog2;
+                                const float candidateLog = candidateHarmonicLog2 + candidateBaseLog2;
+                                const float span = candidateLog - heldLog;
+                                const float idealSeparationCents = 1200.0f * std::abs(span);
+                                bool keepHeld = true;
+                                if(idealSeparationCents >= 5.0f)
+                                {
+                                    const float position = (peakLog2 - heldLog) / span;
+                                    constexpr float switchMargin = 0.10f;
+                                    const bool crossedBoundary = position > 0.5f + switchMargin;
+                                    if(bestDeviation < heldDeviation && crossedBoundary)
+                                        keepHeld = false;
+                                }
+                                if(keepHeld)
+                                {
+                                    bestBase = heldBase;
+                                    bestHarmonic = heldHarmonic;
+                                    bestDeviation = heldDeviation;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+peakHysteresisResolved:
         if(bestBase < 0 || bestHarmonic < 1)
             continue;
         if(duplicatePeak >= 0)
@@ -1224,45 +1483,66 @@ void NewProjectAudioProcessor::rebuildHarmonicPeakList(int channel, float frameM
         ++numPeaks;
     }
 }
-void NewProjectAudioProcessor::detect(int channel)
+void NewProjectAudioProcessor::updateDetectionFrameParams()
 {
-    const float t = juce::jlimit(0.0f, 1.0f, emphasisParam->load());
-    const float s = juce::jlimit(0.0f, 1.0f, attractionParam->load());
-    const float tolWarp = t * t;
-    const float centsTolerance = centsTol + tolWarp * (centsTolMax - centsTol);
-    const float tolLoR = std::exp2(-centsTolerance / 1200.0f);
-    const float tolHiR = std::exp2( centsTolerance / 1200.0f);
+    auto& frame = detectionFrameParams;
+    frame.emphasis = juce::jlimit(0.0f, 1.0f, emphasisParam->load());
+    frame.attraction = juce::jlimit(0.0f, 1.0f, attractionParam->load());
+    const float tolWarp = frame.emphasis * frame.emphasis;
+    frame.centsTolerance = centsTol + tolWarp * (centsTolMax - centsTol);
+    frame.tolLoR = std::exp2(-frame.centsTolerance / 1200.0f);
+    frame.tolHiR = std::exp2( frame.centsTolerance / 1200.0f);
     const float density = juce::jlimit(0.0f, 1.0f, densityParam->load());
-    const float thr = densityToSalienceThreshold(density);
-    const float fineCents = juce::jlimit(-100.0f, 100.0f, fineTuneParam->load());
-    pitchRatio = std::pow(2.0f, pitchParam->load() / 12.0f);
+    frame.densityThreshold = densityToSalienceThreshold(density);
+    frame.fineCents = juce::jlimit(-100.0f, 100.0f, fineTuneParam->load());
+    frame.pitchRatio = std::pow(2.0f, pitchParam->load() / 12.0f);
     const float nyq = (float) (sampleRate * 0.5);
     const float center = centerParam->load();
     const float spread = spreadParam->load();
-    const float fMin = juce::jlimit(20.0f, nyq, center * std::pow(2.0f, -spread));
-    const float fMax = juce::jlimit(20.0f, nyq, center * std::pow(2.0f, spread));
+    frame.fMin = juce::jlimit(20.0f, nyq, center * std::pow(2.0f, -spread));
+    frame.fMax = juce::jlimit(20.0f, nyq, center * std::pow(2.0f, spread));
+    frame.remap = (frame.emphasis > 0.0f || frame.attraction > 0.0f);
+    const bool moreBasesOn = (moreBasesParam != nullptr && moreBasesParam->load() >= 0.5f);
+    frame.peakLimit = moreBasesOn ? extendedMaxPeaks : defaultMaxPeaks;
+    frame.baseLimit = moreBasesOn ? extendedMaxBases : defaultMaxBases;
+    const float salienceGateScale = moreBasesOn ? 0.85f : 1.0f;
+    frame.gatedThreshold = juce::jmax(0.0005f, frame.densityThreshold * salienceGateScale);
+    const int mode = (targetModeParam != nullptr) ? juce::roundToInt(targetModeParam->load()) : 0;
+    frame.heldFineSemis = (mode != 2) ? frame.fineCents / 100.0f : 0.0f;
+    frame.midiOn = (mode == 1);
+    const int midiMask = midiScaleMask.load();
+    for(int i = 0; i < 12; ++i)
+        frame.scaleOn[(size_t) i] = frame.midiOn ? ((midiMask & (1 << i)) != 0)
+                                                 : (noteParam[i]->load() >= 0.5f);
+}
+void NewProjectAudioProcessor::detect(int channel)
+{
+    const auto& frame = detectionFrameParams;
+    const float t = frame.emphasis;
+    const float s = frame.attraction;
+    const float centsTolerance = frame.centsTolerance;
+    const float tolLoR = frame.tolLoR;
+    const float tolHiR = frame.tolHiR;
+    const float fineCents = frame.fineCents;
+    pitchRatio = frame.pitchRatio;
+    const float fMin = frame.fMin;
+    const float fMax = frame.fMax;
+    float maxMag = 0.0f;
     for(int k = 0; k < numBins; ++k)
     {
         binDestFreq[(size_t) k] = pvFreq[(size_t) k] * pitchRatio;
         binTargetAffinity[(size_t) k] = 0.0f;
+        maxMag = std::max(maxMag, pvMag[(size_t) k]);
     }
-    const bool remap = (t > 0.0f || s > 0.0f);
-    const bool moreBasesOn = (moreBasesParam != nullptr && moreBasesParam->load() >= 0.5f);
-    const int peakLimit = moreBasesOn ? extendedMaxPeaks : defaultMaxPeaks;
-    const int baseLimit = moreBasesOn ? extendedMaxBases : defaultMaxBases;
-    const float salienceGateScale = moreBasesOn ? 0.85f : 1.0f;
-    const float gatedThr = juce::jmax(0.0005f, thr * salienceGateScale);
+    const bool remap = frame.remap;
+    const int peakLimit = frame.peakLimit;
+    const int baseLimit = frame.baseLimit;
+    const float gatedThr = frame.gatedThreshold;
     numBases = 0;
     subNumBases = 0;
-    const int mode = (targetModeParam != nullptr) ? juce::roundToInt(targetModeParam->load()) : 0;
-    const float heldFineSemis = (mode != 2) ? fineCents / 100.0f : 0.0f;
-    const bool midiOn = (mode == 1);
-    const int midiMask = midiScaleMask.load();
+    const float heldFineSemis = frame.heldFineSemis;
     for(int i = 0; i < 12; ++i)
-        scaleOn[i] = midiOn ? ((midiMask & (1 << i)) != 0)
-                            : (noteParam[i]->load() >= 0.5f);
-    float maxMag = 0.0f;
-    for(int k = 0; k < numBins; ++k) maxMag = std::max(maxMag, pvMag[(size_t) k]);
+        scaleOn[i] = frame.scaleOn[(size_t) i];
     if(maxMag < silenceMagFloor) { numPeaks = 0; return; }
     const float floorMag = maxMag * peakFloorRel;
     const int inBandLimit = peakLimit;
@@ -1270,23 +1550,36 @@ void NewProjectAudioProcessor::detect(int channel)
     const int superLimit = juce::jmin(peakLimit / 2, maxDetectionPeaks / 4);
     int inBandCount = 0, subCount = 0, superCount = 0;
     numPeaks = 0;
+    rawPeaks.clear();
     const float transformedBinWidth =
         juce::jmax(1.0e-6f, binWidth * pitchRatio);
-    for(int k = 1; k + 1 < numBins && numPeaks < maxDetectionPeaks; ++k)
+    const float harmonicFloor = juce::jmax(1.0e-12f,
+                                            maxMag * partialPeakFloorRel);
+    for(int k = 1; k + 1 < numBins; ++k)
     {
         const float localMaxMag = pvMag[(size_t) k];
-        if(! (localMaxMag > floorMag
-              && localMaxMag > pvMag[(size_t) (k - 1)]
+        if(! (localMaxMag > pvMag[(size_t) (k - 1)]
               && localMaxMag >= pvMag[(size_t) (k + 1)]))
             continue;
         int analysisBin = k;
         float peakHz = 0.0f;
         if(!resolvePeakObservation(channel, k, analysisBin, peakHz))
             continue;
+        const float m = pvMag[(size_t) analysisBin];
+        if(m > harmonicFloor && rawPeaks.size() < (size_t) maxPeaks)
+        {
+            RawPeak& rawPeak = rawPeaks.emplace_back();
+            rawPeak.sourceBin = k;
+            rawPeak.analysisBin = analysisBin;
+            rawPeak.hz = peakHz;
+            rawPeak.mag = m;
+            rawPeak.log2Hz = std::log2(juce::jmax(1.0e-6f, peakHz));
+        }
+        if(numPeaks >= maxDetectionPeaks || localMaxMag <= floorMag)
+            continue;
         if(peakHz < fMin) { if(subCount >= subLimit) continue; }
         else if(peakHz > fMax) { if(superCount >= superLimit) continue; }
         else { if(inBandCount >= inBandLimit) continue; }
-        const float m = pvMag[(size_t) analysisBin];
         int duplicatePeak = -1;
         for(int p = numPeaks - 1; p >= 0; --p)
         {
@@ -1567,6 +1860,7 @@ void NewProjectAudioProcessor::detect(int channel)
             }
         }
     }
+    rebuildFlatBaseCandidates();
     rebuildHarmonicPeakList(channel, maxMag);
     if(! remap)
         return;
@@ -1715,6 +2009,32 @@ float NewProjectAudioProcessor::harmonicAssignmentTolerance(int harmonic,
 {
     return membershipSigma(juce::jmax(1, harmonic), juce::jmax(1.0f, freqHz));
 }
+void NewProjectAudioProcessor::rebuildFlatBaseCandidates()
+{
+    flatBaseCandidates.clear();
+    flatBaseCandidates.reserve((size_t) (numBases + subNumBases + hiNumBases));
+    for(int b = 0; b < numBases; ++b)
+    {
+        const float hz = baseFreq[(size_t) b];
+        if(hz <= 0.0f)
+            continue;
+        flatBaseCandidates.push_back({ b, hz, baseLog2Hz[(size_t) b] });
+    }
+    for(int b = 0; b < subNumBases; ++b)
+    {
+        const float hz = subBaseFreq[(size_t) b];
+        if(hz <= 0.0f)
+            continue;
+        flatBaseCandidates.push_back({ subBaseBase + b, hz, std::log2(hz) });
+    }
+    for(int b = 0; b < hiNumBases; ++b)
+    {
+        const float hz = hiBaseFreq[(size_t) b];
+        if(hz <= 0.0f)
+            continue;
+        flatBaseCandidates.push_back({ hiBaseBase + b, hz, std::log2(hz) });
+    }
+}
 bool NewProjectAudioProcessor::findBaseForHarmonic(float partialHz, int harmonic,
                                                     float preferredBaseHz,
                                                     int& baseIdxOut,
@@ -1726,17 +2046,26 @@ bool NewProjectAudioProcessor::findBaseForHarmonic(float partialHz, int harmonic
     deviationCentsOut = 1.0e9f;
     if(partialHz <= 0.0f || harmonic < 1)
         return false;
+    const float partialLog2 = std::log2(partialHz);
+    const float harmonicLog2 = (harmonic <= harmonicsTagMax)
+        ? log2IntTable[(size_t) harmonic]
+        : std::log2((float) harmonic);
+    const float preferredBaseLog2 = (preferredBaseHz > 0.0f)
+        ? std::log2(preferredBaseHz)
+        : 0.0f;
     float bestScore = 1.0e9f;
-    auto consider = [&] (int encodedIndex, float baseHz)
+    for(const auto& base : flatBaseCandidates)
     {
+        const int encodedIndex = base.encodedIndex;
+        const float baseHz = base.hz;
         if(baseHz <= 0.0f)
-            return;
+            continue;
         const float ideal = (float) harmonic * baseHz;
         if(ideal <= 0.0f)
-            return;
-        const float deviation = std::abs(1200.0f * std::log2(partialHz / ideal));
+            continue;
+        const float deviation = 1200.0f * std::abs(partialLog2 - harmonicLog2 - base.log2Hz);
         const float continuity = (preferredBaseHz > 0.0f)
-            ? std::abs(1200.0f * std::log2(baseHz / preferredBaseHz))
+            ? std::abs(1200.0f * (base.log2Hz - preferredBaseLog2))
             : 0.0f;
         const float score = deviation + 0.15f * juce::jmin(continuity, 200.0f);
         if(score < bestScore)
@@ -1746,13 +2075,7 @@ bool NewProjectAudioProcessor::findBaseForHarmonic(float partialHz, int harmonic
             baseHzOut = baseHz;
             deviationCentsOut = deviation;
         }
-    };
-    for(int b = 0; b < numBases; ++b)
-        consider(b, baseFreq[(size_t) b]);
-    for(int b = 0; b < subNumBases; ++b)
-        consider(subBaseBase + b, subBaseFreq[(size_t) b]);
-    for(int b = 0; b < hiNumBases; ++b)
-        consider(hiBaseBase + b, hiBaseFreq[(size_t) b]);
+    }
     return baseIdxOut >= 0;
 }
 void NewProjectAudioProcessor::updatePartialHarmonicAssignment(Partial& partial,
@@ -1991,9 +2314,9 @@ void NewProjectAudioProcessor::updatePartials(int channel)
                 const float f1 = juce::jmax(1.0e-6f, secondary.freqNat);
                 const float distanceCents = std::abs(1200.0f * std::log2(f1 / f0));
                 const float distanceHz = std::abs(f1 - f0);
-                const float ratio = juce::jmax(f0, f1) / juce::jmin(f0, f1);
                 const bool resolutionMatch =
-                    (distanceHz <= channelLockResolutionHz && ratio < 1.5f);
+                    (distanceHz <= channelLockResolutionHz
+                     && frequenciesWithinRatio(f0, f1, 1.5f));
                 if(distanceCents < partialMatchTolCents || resolutionMatch)
                     matchCands.push_back({ distanceCents, (int) si, (int) pi });
             }
@@ -2122,14 +2445,16 @@ void NewProjectAudioProcessor::identifyHarmonic(float freqAnalysis,
     const float log2fa = std::log2 (freqAnalysis);
     int bBase = -1, bN = 1;
     float bDev = 1.0e9f;
-    for(int b = 0; b < numBases; ++b)
+    for(const auto& base : flatBaseCandidates)
     {
-        const float Fb = baseFreq[(size_t) b];
+        if(base.encodedIndex >= subBaseBase)
+            break;
+        const float Fb = base.hz;
         if(Fb <= 0.0f) continue;
         const int n = juce::jmax(1, (int) std::lround(freqAnalysis / Fb));
         const float ln = (n <= harmonicsTagMax) ? log2IntTable[(size_t) n] : std::log2 ((float) n);
-        const float dev = 1200.0f * std::abs(log2fa - ln - baseLog2Hz[(size_t) b]);
-        if(dev < bDev) { bDev = dev; bBase = b; bN = n; }
+        const float dev = 1200.0f * std::abs(log2fa - ln - base.log2Hz);
+        if(dev < bDev) { bDev = dev; bBase = base.encodedIndex; bN = n; }
     }
     const float tolerance = harmonicAssignmentTolerance(bN, freqAnalysis);
     if(bBase >= 0 && bDev < tolerance) { baseIdxOut = bBase; harmonicOut = bN; }
@@ -2148,73 +2473,122 @@ void NewProjectAudioProcessor::mapToDestination(int channel, bool computePhase)
     std::fill(dstMag.begin(), dstMag.begin() + numBins, 0.0f);
     std::fill(dstFreqNum.begin(), dstFreqNum.begin() + numBins, 0.0f);
     std::fill(dstHitCount.begin(), dstHitCount.begin() + numBins, 0.0f);
-    std::fill(dstRetuneWeight.begin(), dstRetuneWeight.begin() + numBins, 0.0f);
-    std::fill(dstRetunePeak.begin(), dstRetunePeak.begin() + numBins, 0.0f);
+    const float feedbackAmount = (feedbackParam != nullptr)
+        ? juce::jlimit(0.0f, 1.0f, feedbackParam->load())
+        : 0.0f;
+    const float attractionAmount = (attractionParam != nullptr)
+        ? juce::jlimit(0.0f, 1.0f, attractionParam->load())
+        : 0.0f;
     const bool feedbackActive = ! isTimeAdditiveEnabled()
-        && (feedbackParam != nullptr)
-        && (feedbackParam->load() > 0.0f)
-        && (attractionParam != nullptr && attractionParam->load() > 0.0f);
+        && feedbackAmount > 0.0f
+        && attractionAmount > 0.0f;
     if(feedbackActive)
+    {
+        std::fill(dstRetuneWeight.begin(), dstRetuneWeight.begin() + numBins, 0.0f);
+        std::fill(dstRetunePeak.begin(), dstRetunePeak.begin() + numBins, 0.0f);
         std::fill(feedbackAddedMag.begin(), feedbackAddedMag.begin() + numBins, 0.0f);
+    }
     if(computePhase)
         std::fill(dstBestMag.begin(), dstBestMag.begin() + numBins, 0.0f);
-    const float nyq = (float) (sampleRate * 0.5);
-    const float center = centerParam->load();
-    const float spread = spreadParam->load();
-    const float detectMinHz = juce::jlimit(20.0f, nyq, center * std::pow(2.0f, -spread));
-    const auto& bypassMask = transientBypassMask[(size_t) channel];
-    for(int k = 0; k < numBins; ++k)
+    float detectMinHz = 0.0f;
+    if(feedbackActive)
     {
-        if(bypassMask[(size_t) k] != 0)
-            continue;
-        const float sourceFrequency = pvFreq[(size_t) k];
-        const float destinationHz = destinationFrequency(sourceFrequency, k);
-        if(! std::isfinite(sourceFrequency) || ! std::isfinite(destinationHz))
-            continue;
-        const float destinationBin = (float) k
-                                   + (destinationHz - sourceFrequency) / binWidth;
-        const int j = (int) std::lround(destinationBin);
-        if(j >= 0 && j < numBins)
+        const float nyq = (float) (sampleRate * 0.5f);
+        const float center = centerParam->load();
+        const float spread = spreadParam->load();
+        detectMinHz = juce::jlimit(20.0f, nyq, center * std::pow(2.0f, -spread));
+    }
+    const auto& bypassMask = transientBypassMask[(size_t) channel];
+    const float invBinWidth = 1.0f / juce::jmax(1.0e-6f, binWidth);
+    if(computePhase)
+    {
+        for(int k = 0; k < numBins; ++k)
         {
-            const float m = pvMag[(size_t) k];
-            const float srcHz = pvFreq[(size_t) k] * pitchRatio;
-            const float retuneAmt = (srcHz >= detectMinHz)
-                ? std::sqrt(juce::jlimit(0.0f, 1.0f, binTargetAffinity[(size_t) k]))
-                : 0.0f;
-            dstMag[(size_t) j] += m;
-            dstFreqNum[(size_t) j] += m * destinationHz;
-            dstHitCount[(size_t) j] += 1.0f;
-            dstRetuneWeight[(size_t) j] += m * retuneAmt;
-            dstRetunePeak[(size_t) j] = std::max(dstRetunePeak[(size_t) j], retuneAmt);
-            if(computePhase && m > dstBestMag[(size_t) j])
+            if(bypassMask[(size_t) k] != 0)
+                continue;
+            const float sourceFrequency = pvFreq[(size_t) k];
+            const float destinationHz = binDestFreq[(size_t) k];
+            if(! std::isfinite(sourceFrequency) || ! std::isfinite(destinationHz))
+                continue;
+            const float destinationBin = (float) k
+                                       + (destinationHz - sourceFrequency) * invBinWidth;
+            const int j = (int) std::lround(destinationBin);
+            if(j >= 0 && j < numBins)
             {
-                dstBestMag[(size_t) j] = m;
-                dstPhase[(size_t) j] = pvPhase[(size_t) k];
+                const float m = pvMag[(size_t) k];
+                dstMag[(size_t) j] += m;
+                dstFreqNum[(size_t) j] += m * destinationHz;
+                dstHitCount[(size_t) j] += 1.0f;
+                if(feedbackActive)
+                {
+                    const float srcHz = sourceFrequency * pitchRatio;
+                    const float retuneAmt = (srcHz >= detectMinHz)
+                        ? std::sqrt(juce::jlimit(0.0f, 1.0f, binTargetAffinity[(size_t) k]))
+                        : 0.0f;
+                    dstRetuneWeight[(size_t) j] += m * retuneAmt;
+                    dstRetunePeak[(size_t) j] = std::max(dstRetunePeak[(size_t) j], retuneAmt);
+                }
+                if(m > dstBestMag[(size_t) j])
+                {
+                    dstBestMag[(size_t) j] = m;
+                    dstPhase[(size_t) j] = pvPhase[(size_t) k];
+                }
+            }
+        }
+    }
+    else
+    {
+        for(int k = 0; k < numBins; ++k)
+        {
+            if(bypassMask[(size_t) k] != 0)
+                continue;
+            const float sourceFrequency = pvFreq[(size_t) k];
+            const float destinationHz = binDestFreq[(size_t) k];
+            if(! std::isfinite(sourceFrequency) || ! std::isfinite(destinationHz))
+                continue;
+            const float destinationBin = (float) k
+                                       + (destinationHz - sourceFrequency) * invBinWidth;
+            const int j = (int) std::lround(destinationBin);
+            if(j >= 0 && j < numBins)
+            {
+                const float m = pvMag[(size_t) k];
+                dstMag[(size_t) j] += m;
+                dstFreqNum[(size_t) j] += m * destinationHz;
+                dstHitCount[(size_t) j] += 1.0f;
+                if(feedbackActive)
+                {
+                    const float srcHz = sourceFrequency * pitchRatio;
+                    const float retuneAmt = (srcHz >= detectMinHz)
+                        ? std::sqrt(juce::jlimit(0.0f, 1.0f, binTargetAffinity[(size_t) k]))
+                        : 0.0f;
+                    dstRetuneWeight[(size_t) j] += m * retuneAmt;
+                    dstRetunePeak[(size_t) j] = std::max(dstRetunePeak[(size_t) j], retuneAmt);
+                }
             }
         }
     }
     applyEnvelopeCompensation();
-    std::copy(dstMag.begin(), dstMag.begin() + numBins, preFeedbackMag.begin());
     if(feedbackActive)
     {
-        const float fbForDecay = juce::jlimit(0.0f, 1.0f, feedbackParam->load());
-        const float holdDecay = 0.60f + 0.395f * fbForDecay;
+        const float holdDecay = 0.60f + 0.395f * feedbackAmount;
         auto& capHold = capHoldMag[(size_t) channel];
+        auto& prevMag = prevDstMag[(size_t) channel];
+        auto& prevFreq = prevDstFreq[(size_t) channel];
+        auto& prevPre = prevPreFbMag[(size_t) channel];
         for(int j = 0; j < numBins; ++j)
-            capHold[(size_t) j] = juce::jmax(preFeedbackMag[(size_t) j], capHold[(size_t) j] * holdDecay);
         {
-            const float fbKnob = juce::jlimit(0.0f, 1.0f, feedbackParam->load());
-            const float attract = juce::jlimit(0.0f, 1.0f, attractionParam->load()) ;
+            const float pre = dstMag[(size_t) j];
+            preFeedbackMag[(size_t) j] = pre;
+            capHold[(size_t) j] = juce::jmax(pre, capHold[(size_t) j] * holdDecay);
+        }
+        {
             {
                 const float baseHopRatio = 0.25f;
                 const float hopRatio = (fftSize > 0) ? ((float) hopSize / (float) fftSize) : baseHopRatio;
                 const float norm = std::pow(juce::jmax(1.0e-6f, hopRatio / baseHopRatio), 0.25f);
                 const float fbDrive = 2.3f;
-                const float fb = juce::jlimit(0.0f, 0.996f, fbDrive * fbKnob * attract * norm);
-                const float capMul = 1.0f + 0.22f * fbKnob;
-                auto& prevMag = prevDstMag[(size_t) channel];
-                auto& prevFreq = prevDstFreq[(size_t) channel];
-                auto& prevPre = prevPreFbMag[(size_t) channel];
+                const float fb = juce::jlimit(0.0f, 0.996f, fbDrive * feedbackAmount * attractionAmount * norm);
+                const float capMul = 1.0f + 0.22f * feedbackAmount;
                 for(int j = 0; j < numBins; ++j)
                 {
                     const float dm = dstMag[(size_t) j];
@@ -2227,7 +2601,7 @@ void NewProjectAudioProcessor::mapToDestination(int channel, bool computePhase)
                         continue;
                     const float peakAff = juce::jlimit(0.0f, 1.0f, dstRetunePeak[(size_t) j]);
                     const float retunedRatio = dstRetuneWeight[(size_t) j] / (dm + 1.0e-9f);
-                    const float minRetuned = attract * (0.10f + 0.35f * peakAff);
+                    const float minRetuned = attractionAmount * (0.10f + 0.35f * peakAff);
                     const float retunedNow = juce::jlimit(0.0f, 1.0f,
                                                            juce::jmax(4.5f * retunedRatio, minRetuned));
                     if(retunedNow <= 0.0f)
@@ -2252,38 +2626,36 @@ void NewProjectAudioProcessor::mapToDestination(int channel, bool computePhase)
                 }
             }
         }
-    }
-    for(int j = 0; j < numBins; ++j)
-        dstFreq[(size_t) j] = (dstMag[(size_t) j] > 0.0f)
-                                ? dstFreqNum[(size_t) j] / dstMag[(size_t) j]
-                                : 0.0f;
-    if(feedbackActive)
-    {
-        auto& prevMag = prevDstMag[(size_t) channel];
-        auto& prevFreq = prevDstFreq[(size_t) channel];
-        auto& prevPre = prevPreFbMag[(size_t) channel];
-        std::copy(dstMag.begin(), dstMag.begin() + numBins, prevMag.begin());
-        std::copy(dstFreq.begin(), dstFreq.begin() + numBins, prevFreq.begin());
-        std::copy(preFeedbackMag.begin(), preFeedbackMag.begin() + numBins, prevPre.begin());
-    }
-    if(feedbackActive)
-    {
         const float compAmount = 0.28f;
         for(int j = 0; j < numBins; ++j)
         {
+            const float mag = dstMag[(size_t) j];
+            const float freq = (mag > 0.0f)
+                ? dstFreqNum[(size_t) j] / mag
+                : 0.0f;
+            dstFreq[(size_t) j] = freq;
+            prevMag[(size_t) j] = mag;
+            prevFreq[(size_t) j] = freq;
+            prevPre[(size_t) j] = preFeedbackMag[(size_t) j];
             const float added = feedbackAddedMag[(size_t) j];
             if(added <= 0.0f)
                 continue;
-        const float postMag = dstMag[(size_t) j];
-        const float preMag = juce::jmax(1.0e-6f, postMag - added);
-        const float gainIncrease = added / preMag;
-        const float addGain = 1.0f / (1.0f + compAmount * gainIncrease);
-        const float compensatedAdded = added * addGain;
-        dstMag[(size_t) j] = preMag + compensatedAdded;
-        const float postNum = dstFreqNum[(size_t) j];
-        const float preNum = postNum - added * prevDstFreq[(size_t) channel][(size_t) j];
-        dstFreqNum[(size_t) j] = preNum + compensatedAdded * prevDstFreq[(size_t) channel][(size_t) j];
+            const float preMag = juce::jmax(1.0e-6f, mag - added);
+            const float gainIncrease = added / preMag;
+            const float addGain = 1.0f / (1.0f + compAmount * gainIncrease);
+            const float compensatedAdded = added * addGain;
+            dstMag[(size_t) j] = preMag + compensatedAdded;
+            const float postNum = dstFreqNum[(size_t) j];
+            const float preNum = postNum - added * freq;
+            dstFreqNum[(size_t) j] = preNum + compensatedAdded * freq;
         }
+    }
+    else
+    {
+        for(int j = 0; j < numBins; ++j)
+            dstFreq[(size_t) j] = (dstMag[(size_t) j] > 0.0f)
+                                    ? dstFreqNum[(size_t) j] / dstMag[(size_t) j]
+                                    : 0.0f;
     }
 }
 void NewProjectAudioProcessor::applyEnvelopeCompensation()
@@ -2306,35 +2678,36 @@ float NewProjectAudioProcessor::additiveEnvelopeCompAmount() const noexcept
 void NewProjectAudioProcessor::buildEnvelopeCompensationCurve(float amount,
                                                               bool applyToDestination)
 {
-    std::fill(envAppliedGain.begin(), envAppliedGain.begin() + numBins, 1.0f);
     if(amount <= 0.0f)
-        return;
-    std::fill(envRefMag.begin(), envRefMag.begin() + numBins, 0.0f);
-    const float invPitch = 1.0f / juce::jmax(1.0e-6f, pitchRatio);
-    for(int j = 0; j < numBins; ++j)
     {
-        const float src = (float) j * invPitch;
-        if(src <= 0.0f)
-        {
-            envRefMag[(size_t) j] = pvMag[0];
-            continue;
-        }
-        const int i0 = (int) std::floor(src);
-        if(i0 >= numBins - 1)
-        {
-            envRefMag[(size_t) j] = 0.0f;
-            continue;
-        }
-        const float frac = src - (float) i0;
-        const float m0 = pvMag[(size_t) juce::jmax(0, i0)];
-        const float m1 = pvMag[(size_t) juce::jmax(0, i0 + 1)];
-        envRefMag[(size_t) j] = m0 + (m1 - m0) * frac;
+        std::fill(envAppliedGain.begin(), envAppliedGain.begin() + numBins, 1.0f);
+        return;
     }
+    envAppliedGain[0] = 1.0f;
+    const float invPitch = 1.0f / juce::jmax(1.0e-6f, pitchRatio);
+    const float dcMag = pvMag[0];
     envRefPrefix[0] = 0.0f;
     envOutPrefix[0] = 0.0f;
     for(int j = 0; j < numBins; ++j)
     {
-        envRefPrefix[(size_t) (j + 1)] = envRefPrefix[(size_t) j] + envRefMag[(size_t) j];
+        float refMag = 0.0f;
+        const float src = (float) j * invPitch;
+        if(src <= 0.0f)
+        {
+            refMag = dcMag;
+        }
+        else
+        {
+            const int i0 = (int) std::floor(src);
+            if(i0 < numBins - 1)
+            {
+                const float frac = src - (float) i0;
+                const float m0 = pvMag[(size_t) i0];
+                const float m1 = pvMag[(size_t) (i0 + 1)];
+                refMag = m0 + (m1 - m0) * frac;
+            }
+        }
+        envRefPrefix[(size_t) (j + 1)] = envRefPrefix[(size_t) j] + refMag;
         envOutPrefix[(size_t) (j + 1)] = envOutPrefix[(size_t) j] + dstMag[(size_t) j];
     }
     const float maxOctSpan = 3.0f;
@@ -2615,14 +2988,6 @@ void NewProjectAudioProcessor::removeTimeAdditiveOwnedSpectrum(int channel)
                                              p.timeOwnership * shape);
         }
     }
-    for(int j = 0; j < numBins; ++j)
-    {
-        if(transientBypassMask[(size_t) channel][(size_t) j] != 0)
-            continue;
-        const float keep = 1.0f - juce::jlimit(0.0f, 1.0f, accCov[(size_t) j]);
-        dstMag[(size_t) j] *= keep;
-        dstFreqNum[(size_t) j] *= keep;
-    }
 }
 void NewProjectAudioProcessor::renderTimeAdditive(int channel)
 {
@@ -2700,10 +3065,13 @@ void NewProjectAudioProcessor::synthesizeAdditive(int channel, bool reseed)
             outPh[j] = (dstMag[(size_t) j] > 0.0f) ? dstPhase[(size_t) j] : 0.0f;
         synthSeed[(size_t) channel] = false;
     }
-    std::fill(accRe.begin(), accRe.begin() + numBins, 0.0f);
-    std::fill(accIm.begin(), accIm.begin() + numBins, 0.0f);
-    std::fill(accCov.begin(), accCov.begin() + numBins, 0.0f);
     const bool timeAdditive = isTimeAdditiveEnabled();
+    if(! timeAdditive)
+    {
+        std::fill(accRe.begin(), accRe.begin() + numBins, 0.0f);
+        std::fill(accIm.begin(), accIm.begin() + numBins, 0.0f);
+        std::fill(accCov.begin(), accCov.begin() + numBins, 0.0f);
+    }
     const float morph = timeAdditive ? 0.0f
                                      : juce::jlimit(0.0f, 1.0f, morphParam->load());
     const int L = (int) synKernelRe.size();
@@ -2741,7 +3109,14 @@ void NewProjectAudioProcessor::synthesizeAdditive(int channel, bool reseed)
     }
     for(int j = 0; j < numBins; ++j)
     {
-        const float mag = dstMag[(size_t) j];
+        float mag = dstMag[(size_t) j];
+        if(timeAdditive && bypassMask[(size_t) j] == 0)
+        {
+            const float keep = 1.0f - juce::jlimit(0.0f, 1.0f, accCov[(size_t) j]);
+            mag *= keep;
+            dstMag[(size_t) j] = mag;
+            dstFreqNum[(size_t) j] *= keep;
+        }
         if(mag <= 0.0f)
         {
             fd[2 * j] = 0.0f;
@@ -2753,13 +3128,16 @@ void NewProjectAudioProcessor::synthesizeAdditive(int channel, bool reseed)
                 outPh[j] = wrapPhase(outPh[j] + dstFreq[(size_t) j] * twoPi * hopDuration);
             if(bypassMask[(size_t) j] == 0)
             {
-                const float cov = juce::jmin(1.0f, accCov[(size_t) j]);
                 float phase = outPh[j];
-                if(cov > 1.0e-4f && (accRe[(size_t) j] != 0.0f || accIm[(size_t) j] != 0.0f))
+                if(! timeAdditive)
                 {
-                    const float targetPhase = fastAtan2 (accIm[(size_t) j], accRe[(size_t) j]);
-                    const float t = morph * cov;
-                    phase = wrapPhase(outPh[j] + t * wrapPhase(targetPhase - outPh[j]));
+                    const float cov = juce::jmin(1.0f, accCov[(size_t) j]);
+                    if(cov > 1.0e-4f && (accRe[(size_t) j] != 0.0f || accIm[(size_t) j] != 0.0f))
+                    {
+                        const float targetPhase = fastAtan2 (accIm[(size_t) j], accRe[(size_t) j]);
+                        const float t = morph * cov;
+                        phase = wrapPhase(outPh[j] + t * wrapPhase(targetPhase - outPh[j]));
+                    }
                 }
                 float sp, cp;
                 fastSinCos(phase, sp, cp);
@@ -2767,7 +3145,7 @@ void NewProjectAudioProcessor::synthesizeAdditive(int channel, bool reseed)
                 fd[2 * j + 1] = mag * sp;
             }
         }
-        if(bypassMask[(size_t) j] != 0)
+        if(bypassMask[(size_t) j] != 0 && ! isMutedDisableMask(bypassMask[(size_t) j]))
         {
             fd[2 * j] = bypassRe[(size_t) j];
             fd[2 * j + 1] = bypassIm[(size_t) j];
@@ -2905,7 +3283,7 @@ void NewProjectAudioProcessor::processFrame(int channel)
     for(int i = wrapSplit; i < fftSize; ++i)
         fd[i] = in[(size_t)(i - wrapSplit)] * window[(size_t) i];
     fftEngines[(size_t) (currentOrder - minOrder)]->performRealOnlyForwardTransform(fd, false);
-    analyze(channel);
+    const float ts = analyze(channel);
     const bool pvBypassed = (bypassParam == nullptr || bypassParam->load() < 0.5f);
     if(pvBypassed)
     {
@@ -2930,8 +3308,6 @@ void NewProjectAudioProcessor::processFrame(int channel)
             out[(size_t)(i - wrapSplit)] += fd[i] * window[(size_t) i] * windowCorrection;
         return;
     }
-    const float ts = detectTransient(channel);
-    updateTransientBypass(channel);
     if(tsActive)
     {
         tsMask[(size_t) channel].compute(pvMag.data(), tsMaskBuf.data());
@@ -3142,6 +3518,7 @@ void NewProjectAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
                 else
                     scDetector.publishGatedFrame(pvBypassed);
             }
+            updateDetectionFrameParams();
             for(int ch = 0; ch < numCh; ++ch)
                 processFrame(ch);
         }
