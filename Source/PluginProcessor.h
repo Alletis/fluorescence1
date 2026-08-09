@@ -33,6 +33,7 @@ private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
     void reconfigure(int newOrder, int newOverlap);
     void processFrame(int channel);
+    void resetProcessingStateForStereoModeSwitch();
     float analyze(int channel);
     void processPV(int channel);
     void updateDetectionFrameParams();
@@ -393,6 +394,8 @@ private:
     int numBases = 0;
     bool scaleOn[12] = { false };
     std::array<float, maxChannels> prevPrimary {};
+    bool stereoModePrimed = false;
+    bool processingMidSide = false;
     int pos = 0;
     int count = 0;
     std::atomic<float>* sizeParam = nullptr;

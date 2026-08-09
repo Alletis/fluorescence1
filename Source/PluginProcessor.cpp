@@ -3367,6 +3367,58 @@ void NewProjectAudioProcessor::processFrame(int channel)
     if(timeAdditive)
         renderTimeAdditive(channel);
 }
+void NewProjectAudioProcessor::resetProcessingStateForStereoModeSwitch()
+{
+    for(auto& fifo : inputFifo)
+        std::fill(fifo.begin(), fifo.end(), 0.0f);
+    for(auto& fifo : outputFifo)
+        std::fill(fifo.begin(), fifo.end(), 0.0f);
+    for(auto& phase : prevPhase)
+        std::fill(phase.begin(), phase.end(), 0.0f);
+    for(auto& phase : outPhase)
+        std::fill(phase.begin(), phase.end(), 0.0f);
+    for(auto& logMag : prevLogMag)
+        std::fill(logMag.begin(), logMag.end(), 0.0f);
+    for(auto& prevMag : prevDstMag)
+        std::fill(prevMag.begin(), prevMag.end(), 0.0f);
+    for(auto& prevFreq : prevDstFreq)
+        std::fill(prevFreq.begin(), prevFreq.end(), 0.0f);
+    for(auto& prevPre : prevPreFbMag)
+        std::fill(prevPre.begin(), prevPre.end(), 0.0f);
+    for(auto& hold : capHoldMag)
+        std::fill(hold.begin(), hold.end(), 0.0f);
+    for(auto& prevMag : prevPvMag)
+        std::fill(prevMag.begin(), prevMag.end(), 0.0f);
+    for(auto& bypassRe : transientBypassRe)
+        std::fill(bypassRe.begin(), bypassRe.end(), 0.0f);
+    for(auto& bypassIm : transientBypassIm)
+        std::fill(bypassIm.begin(), bypassIm.end(), 0.0f);
+    for(auto& bypassMask : transientBypassMask)
+        std::fill(bypassMask.begin(), bypassMask.end(), (unsigned char) 0);
+    for(auto& parts : partials)
+        parts.clear();
+    for(auto& voices : timeVoices)
+        voices.clear();
+    for(auto& refs : basePhase)
+        refs.clear();
+    fluxBaseline.fill(0.0f);
+    heldStrength.fill(0.0f);
+    holdRemaining.fill(0);
+    transientInit.fill(false);
+    analysisSeed.fill(true);
+    synthSeed.fill(true);
+    timeAdditiveWasEnabled.fill(false);
+    prevPrimary.fill(0.0f);
+    subPrevPrimary.fill(0.0f);
+    hiPrevPrimary.fill(0.0f);
+    formantGainValid.fill(false);
+    formantHopCounter.fill(0);
+    for(auto& channelTracked : tracked)
+        for(auto& slot : channelTracked)
+            slot = TrackedBase {};
+    numPeaks = 0;
+    numBases = 0;
+}
 void NewProjectAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
                                              juce::MidiBuffer& midiMessages)
 {
@@ -3462,6 +3514,13 @@ void NewProjectAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     const int numCh = juce::jmin(buffer.getNumChannels(), maxChannels);
     const int numSamples = buffer.getNumSamples();
     const bool ms = (msParam->load() >= 0.5f) && numCh == 2;
+    if(numCh == 2)
+    {
+        if(stereoModePrimed && ms != processingMidSide)
+            resetProcessingStateForStereoModeSwitch();
+        processingMidSide = ms;
+        stereoModePrimed = true;
+    }
     float* chPtr[maxChannels] = { nullptr, nullptr };
     for(int ch = 0; ch < numCh; ++ch)
         chPtr[ch] = buffer.getWritePointer(ch);
