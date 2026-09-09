@@ -67,6 +67,9 @@ namespace ScaleLibrary
                 { "MinMaj 7", m({ 0,3,7,11 }) },
                 { "Major 6", m({ 0,4,7,9 }) },
                 { "Minor 6", m({ 0,3,7,9 }) },
+                { "Major 9", m({ 0,2,4,7 }) },
+                { "Dominant 9", m({ 0,2,4,7,10 }) },
+                { "Minor 9", m({ 0,2,3,7,10 }) },
                 { "Major 11", m({ 0,2,4,5,7,11 }) },
                 { "Dominant 11", m({ 0,2,4,5,7,10 }) },
                 { "Minor 11", m({ 0,2,3,5,7,10 }) },
@@ -111,10 +114,12 @@ namespace ScaleLibrary
         {
             juce::PopupMenu tri; addGroup(tri, { 35,36,37,38,39,40 }, currentId);
             juce::PopupMenu sev; addGroup(sev, { 41,42,43,44,45,46,47,48 }, currentId);
-            juce::PopupMenu ele; addGroup(ele, { 49,50,51 }, currentId);
+            juce::PopupMenu nine; addGroup(nine, { 49,50,51 }, currentId);
+            juce::PopupMenu ele; addGroup(ele, { 52,53,54 }, currentId);
             juce::PopupMenu ch;
             ch.addSubMenu("Triads", tri);
             ch.addSubMenu("Sevenths", sev);
+            ch.addSubMenu("Ninths", nine);
             ch.addSubMenu("Elevenths", ele);
             root.addSubMenu("Chords", ch);
         }
