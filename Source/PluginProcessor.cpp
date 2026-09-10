@@ -211,7 +211,7 @@ void FluorescenceAudioProcessor::prepareToPlay(double sr, int)
     }
     tsMaskBuf.assign(maxBins, 0.0f);
     tsScratch.assign(2 * maxFftSize, 0.0f);
-    tsDispMag.assign(maxBins, 0.0f);
+    for(auto& magnitudes : tsDispMag) magnitudes.assign(maxBins, 0.0f);
     pvMag.assign(maxBins, 0.0f);
     pvFreq.assign(maxBins, 0.0f);
     pvPhase.assign(maxBins, 0.0f);
@@ -3117,20 +3117,18 @@ void FluorescenceAudioProcessor::synthesizeAdditive(int channel, bool reseed)
     fd[1] = 0.0f;
     fd[2 * (N / 2) + 1] = 0.0f;
 }
-void FluorescenceAudioProcessor::publishSpectrum()
+void FluorescenceAudioProcessor::captureSpectrum(int channel)
 {
-    auto& s = spectrumBridge.startWrite();
-    s.numBins = numBins;
-    s.binWidth = binWidth;
-    s.sampleRate = sampleRate;
-    s.pvBypassed = (bypassParam == nullptr || bypassParam->load() < 0.5f);
-    const int nb = juce::jmin(numBins, (int) s.mag.size());
-    if(s.pvBypassed)
+    auto& outMag = spectrumMag[(size_t) channel];
+    auto& outFreq = spectrumFreq[(size_t) channel];
+    const bool pvBypassed = (bypassParam == nullptr || bypassParam->load() < 0.5f);
+    const int nb = juce::jmin(numBins, maxBins);
+    if(pvBypassed)
     {
         for(int j = 0; j < nb; ++j)
         {
-            s.mag [(size_t) j] = pvMag [(size_t) j] * spectrumNorm;
-            s.freq[(size_t) j] = pvFreq[(size_t) j];
+            outMag [(size_t) j] = pvMag [(size_t) j] * spectrumNorm;
+            outFreq[(size_t) j] = pvFreq[(size_t) j];
         }
     }
     else
@@ -3143,52 +3141,52 @@ void FluorescenceAudioProcessor::publishSpectrum()
             const unsigned char mask = bMask[(size_t) j];
             if(isMutedDisableMask(mask))
             {
-                const float trMag = tsActive ? tsDispMag[(size_t) j] : 0.0f;
+                const float trMag = tsActive ? tsDispMag[(size_t) channel][(size_t) j] : 0.0f;
                 if(trMag > dstMag[(size_t) j])
                 {
-                    s.mag [(size_t) j] = trMag * spectrumNorm;
-                    s.freq[(size_t) j] = pvFreq[(size_t) j];
+                    outMag [(size_t) j] = trMag * spectrumNorm;
+                    outFreq[(size_t) j] = pvFreq[(size_t) j];
                 }
                 else
                 {
-                    s.mag [(size_t) j] = dstMag [(size_t) j] * spectrumNorm;
-                    s.freq[(size_t) j] = dstFreq[(size_t) j];
+                    outMag [(size_t) j] = dstMag [(size_t) j] * spectrumNorm;
+                    outFreq[(size_t) j] = dstFreq[(size_t) j];
                 }
             }
             else if(mask != 0)
             {
                 const float re = bRe[(size_t) j], im = bIm[(size_t) j];
                 const float bypassMag = std::sqrt(re * re + im * im) * spectrumNorm;
-                const float trMag = tsActive ? tsDispMag[(size_t) j] : 0.0f;
+                const float trMag = tsActive ? tsDispMag[(size_t) channel][(size_t) j] : 0.0f;
                 if(trMag > bypassMag)
                 {
-                    s.mag [(size_t) j] = trMag * spectrumNorm;
-                    s.freq[(size_t) j] = pvFreq[(size_t) j];
+                    outMag [(size_t) j] = trMag * spectrumNorm;
+                    outFreq[(size_t) j] = pvFreq[(size_t) j];
                 }
                 else
                 {
-                    s.mag [(size_t) j] = bypassMag;
-                    s.freq[(size_t) j] = pvFreq[(size_t) j];
+                    outMag [(size_t) j] = bypassMag;
+                    outFreq[(size_t) j] = pvFreq[(size_t) j];
                 }
             }
             else
             {
-                const float trMag = tsActive ? tsDispMag[(size_t) j] : 0.0f;
+                const float trMag = tsActive ? tsDispMag[(size_t) channel][(size_t) j] : 0.0f;
                 if(trMag > dstMag[(size_t) j])
                 {
-                    s.mag [(size_t) j] = trMag * spectrumNorm;
-                    s.freq[(size_t) j] = pvFreq[(size_t) j];
+                    outMag [(size_t) j] = trMag * spectrumNorm;
+                    outFreq[(size_t) j] = pvFreq[(size_t) j];
                 }
                 else
                 {
-                    s.mag [(size_t) j] = dstMag [(size_t) j] * spectrumNorm;
-                    s.freq[(size_t) j] = dstFreq[(size_t) j];
+                    outMag [(size_t) j] = dstMag [(size_t) j] * spectrumNorm;
+                    outFreq[(size_t) j] = dstFreq[(size_t) j];
                 }
             }
         }
         if(isTimeAdditiveEnabled())
         {
-            const auto& voices = timeVoices[0];
+            const auto& voices = timeVoices[(size_t) channel];
             const int L = (int) synKernelMag.size();
             const int centre = kernelHalf * kernelOS;
             for(const auto& voice : voices)
@@ -3204,7 +3202,7 @@ void FluorescenceAudioProcessor::publishSpectrum()
                 const int j1 = juce::jmin(nb - 1, (int) std::floor(b + kernelHalf));
                 for(int j = j0; j <= j1; ++j)
                 {
-                    const unsigned char mask = transientBypassMask[0][(size_t) j];
+                    const unsigned char mask = transientBypassMask[(size_t) channel][(size_t) j];
                     if(mask != 0 && ! isMutedDisableMask(mask))
                         continue;
                     const float tf = ((float) j - b) * (float) kernelOS + (float) centre;
@@ -3215,22 +3213,46 @@ void FluorescenceAudioProcessor::publishSpectrum()
                     const float kmag = synKernelMag[(size_t) ti]
                         + (synKernelMag[(size_t) (ti + 1)] - synKernelMag[(size_t) ti]) * fr;
                     const float additiveMag = voiceAmp * kmag;
-                    if(additiveMag > s.mag[(size_t) j])
+                    if(additiveMag > outMag[(size_t) j])
                     {
-                        s.mag [(size_t) j] = additiveMag;
-                        s.freq[(size_t) j] = voiceFreq;
+                        outMag [(size_t) j] = additiveMag;
+                        outFreq[(size_t) j] = voiceFreq;
                     }
                 }
             }
         }
     }
-    const int nbases = juce::jmin(numBases, (int) s.baseHz.size());
-    for(int i = 0; i < nbases; ++i)
+    spectrumNumBases[(size_t) channel] = juce::jmin(numBases, maxBases);
+    for(int i = 0; i < spectrumNumBases[(size_t) channel]; ++i)
     {
-        s.baseHz [(size_t) i] = baseDisplayHz[(size_t) i];
-        s.baseConf[(size_t) i] = baseConf [(size_t) i];
+        spectrumBaseHz [(size_t) channel][(size_t) i] = baseDisplayHz[(size_t) i];
+        spectrumBaseConf[(size_t) channel][(size_t) i] = baseConf [(size_t) i];
     }
-    s.numBases = nbases;
+}
+void FluorescenceAudioProcessor::publishSpectrum(int numChannels)
+{
+    auto& s = spectrumBridge.startWrite();
+    s.numChannels = juce::jlimit(0, maxChannels, numChannels);
+    s.numBins = numBins;
+    s.binWidth = binWidth;
+    s.sampleRate = sampleRate;
+    s.pvBypassed = (bypassParam == nullptr || bypassParam->load() < 0.5f);
+    const int nb = juce::jmin(numBins, maxBins);
+    for(int channel = 0; channel < s.numChannels; ++channel)
+        for(int j = 0; j < nb; ++j)
+        {
+            s.mag [(size_t) channel][(size_t) j] = spectrumMag [(size_t) channel][(size_t) j];
+            s.freq[(size_t) channel][(size_t) j] = spectrumFreq[(size_t) channel][(size_t) j];
+        }
+    for(int channel = 0; channel < s.numChannels; ++channel)
+    {
+        s.numBases[(size_t) channel] = spectrumNumBases[(size_t) channel];
+        for(int i = 0; i < s.numBases[(size_t) channel]; ++i)
+        {
+            s.baseHz [(size_t) channel][(size_t) i] = spectrumBaseHz[(size_t) channel][(size_t) i];
+            s.baseConf[(size_t) channel][(size_t) i] = spectrumBaseConf[(size_t) channel][(size_t) i];
+        }
+    }
     spectrumBridge.publish();
 }
 void FluorescenceAudioProcessor::processFrame(int channel)
@@ -3260,10 +3282,8 @@ void FluorescenceAudioProcessor::processFrame(int channel)
         std::fill(prevPreFbMag[(size_t) channel].begin(), prevPreFbMag[(size_t) channel].begin() + numBins, 0.0f);
         std::fill(capHoldMag[(size_t) channel].begin(), capHoldMag[(size_t) channel].begin() + numBins, 0.0f);
         if(channel == 0)
-        {
             numBases = 0;
-            publishSpectrum();
-        }
+        captureSpectrum(channel);
         fftEngines[(size_t) (currentOrder - minOrder)]->performRealOnlyInverseTransform(fd);
         for(int i = 0; i < wrapSplit; ++i)
             out[(size_t)(pos + i)] += fd[i] * window[(size_t) i] * windowCorrection;
@@ -3283,7 +3303,7 @@ void FluorescenceAudioProcessor::processFrame(int channel)
             sc[2 * k] *= mk;
             sc[2 * k + 1] *= mk;
             pvMag[(size_t) k] = full * (1.0f - mk);
-            if(channel == 0) tsDispMag[(size_t) k] = full * mk;
+            tsDispMag[(size_t) channel][(size_t) k] = full * mk;
         }
         fftEngines[(size_t) (currentOrder - minOrder)]->performRealOnlyInverseTransform(sc);
         for(int i = 0; i < wrapSplit; ++i)
@@ -3320,8 +3340,7 @@ void FluorescenceAudioProcessor::processFrame(int channel)
         updateTimeAdditiveVoices(channel);
     }
     synthesizeAdditive(channel, reseed);
-    if(channel == 0)
-        publishSpectrum();
+    captureSpectrum(channel);
     fftEngines[(size_t) (currentOrder - minOrder)]->performRealOnlyInverseTransform(fd);
     for(int i = 0; i < wrapSplit; ++i)
         out[(size_t)(pos + i)] += fd[i] * window[(size_t) i] * windowCorrection;
@@ -3454,13 +3473,11 @@ void FluorescenceAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     SidechainDetector<maxBins, maxBases>::Params scP;
     const float* scIn[2] = { nullptr, nullptr };
     int scNumCh = 0;
-    float scNorm = 1.0f;
     if(scVisualRun)
     {
         auto scBuffer = getBusBuffer(buffer, true, 1);
         scNumCh = juce::jmin(2, scBuffer.getNumChannels());
         for(int ch = 0; ch < scNumCh; ++ch) scIn[ch] = scBuffer.getReadPointer(ch);
-        scNorm = (scNumCh > 0) ? 1.0f / (float) scNumCh : 1.0f;
     }
     if(scRun)
     {
@@ -3518,31 +3535,29 @@ void FluorescenceAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
             }
         }
         if(scVisualRun)
-        {
-            float scs = 0.0f;
-            for(int ch = 0; ch < scNumCh; ++ch) scs += scIn[ch][s];
-            scDetector.pushSample(pos, scs * scNorm);
-        }
+            for(int ch = 0; ch < scNumCh; ++ch)
+                scDetector.pushSample(ch, pos, scIn[ch][s]);
         pos = (pos + 1) & fftMask;
         if(++count == hopSize)
         {
             count = 0;
             if(scRun)
             {
-                scDetector.processHop(pos, scP);
+                scDetector.processHop(pos, scNumCh, scP);
                 scNumTargets = scDetector.copyTargets(scTargetHz.data(), maxBases);
             }
             else
             {
                 scNumTargets = 0;
                 if(pvBypassed && scVisualRun)
-                    scDetector.processBypassHop(pos);
+                    scDetector.processBypassHop(pos, scNumCh);
                 else
                     scDetector.publishGatedFrame(pvBypassed);
             }
             updateDetectionFrameParams();
             for(int ch = 0; ch < numCh; ++ch)
                 processFrame(ch);
+            publishSpectrum(numCh);
         }
     }
 }

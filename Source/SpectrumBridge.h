@@ -6,15 +6,17 @@
 template <int MaxBins, int MaxBases>
 struct SpectrumSnapshot
 {
+    static constexpr int maxChannels = 2;
+    int numChannels = 0;
     int numBins = 0;
     float binWidth = 0.0f;
     double sampleRate = 44100.0;
-    int numBases = 0;
+    std::array<int, maxChannels> numBases {};
     bool pvBypassed = false;
-    std::array<float, MaxBins> mag {};
-    std::array<float, MaxBins> freq {};
-    std::array<float, MaxBases> baseHz {};
-    std::array<float, MaxBases> baseConf {};
+    std::array<std::array<float, MaxBins>, maxChannels> mag {};
+    std::array<std::array<float, MaxBins>, maxChannels> freq {};
+    std::array<std::array<float, MaxBases>, maxChannels> baseHz {};
+    std::array<std::array<float, MaxBases>, maxChannels> baseConf {};
 };
 template <int MaxBins, int MaxBases>
 class SpectrumBridge

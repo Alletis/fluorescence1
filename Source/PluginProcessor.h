@@ -63,7 +63,8 @@ private:
     float estimateTimeAdditiveAmplitude(int peakIndex) const;
     bool isTimeAdditiveEnabled() const noexcept;
     float detectTransient(int channel);
-    void publishSpectrum();
+    void captureSpectrum(int channel);
+    void publishSpectrum(int numChannels);
     float effectiveDisableFreqHi() const noexcept;
     bool isDisableLoActive() const noexcept;
     bool isDisableHiActive() const noexcept;
@@ -209,7 +210,7 @@ private:
     transientsplit::TransientMask tsMask[maxChannels];
     std::vector<float> tsMaskBuf;
     std::vector<float> tsScratch;
-    std::vector<float> tsDispMag;
+    std::array<std::vector<float>, maxChannels> tsDispMag;
     bool tsActive = false;
     std::array<float, maxChannels> fluxBaseline {};
     std::array<float, maxChannels> heldStrength {};
@@ -397,6 +398,11 @@ private:
     std::array<float, maxChannels> prevPrimary {};
     bool stereoModePrimed = false;
     bool processingMidSide = false;
+    std::array<std::array<float, maxBins>, maxChannels> spectrumMag {};
+    std::array<std::array<float, maxBins>, maxChannels> spectrumFreq {};
+    std::array<std::array<float, maxBases>, maxChannels> spectrumBaseHz {};
+    std::array<std::array<float, maxBases>, maxChannels> spectrumBaseConf {};
+    std::array<int, maxChannels> spectrumNumBases {};
     int pos = 0;
     int count = 0;
     std::atomic<float>* sizeParam = nullptr;

@@ -19,20 +19,26 @@ public:
     };
     void prepare(int maxFftSize)
     {
-        scFifo.assign((size_t) maxFftSize, 0.0f);
         fftData.assign((size_t) (2 * maxFftSize), 0.0f);
         pvMag.assign((size_t) MaxBins, 0.0f);
         pvFreq.assign((size_t) MaxBins, 0.0f);
-        pvPhase.assign((size_t) MaxBins, 0.0f);
-        prevPhase.assign((size_t) MaxBins, 0.0f);
+        for(int channel = 0; channel < maxChannels; ++channel)
+        {
+            scFifo[(size_t) channel].assign((size_t) maxFftSize, 0.0f);
+            channelMag[(size_t) channel].assign((size_t) MaxBins, 0.0f);
+            channelFreq[(size_t) channel].assign((size_t) MaxBins, 0.0f);
+            channelPhase[(size_t) channel].assign((size_t) MaxBins, 0.0f);
+            prevPhase[(size_t) channel].assign((size_t) MaxBins, 0.0f);
+        }
         peakFreq.assign((size_t) maxPeaks, 0.0f);
         peakAmp.assign((size_t) maxPeaks, 0.0f);
         peakWork.assign((size_t) maxPeaks, 0.0f);
         baseFreq.assign((size_t) MaxBases, 0.0f);
         baseSal.assign((size_t) MaxBases, 0.0f);
         baseConf.assign((size_t) MaxBases, 0.0f);
-        analysisSeed = true;
-        prevPrimary = 0.0f;
+        analysisSeed.fill(true);
+        prevPrimary.fill(0.0f);
+        channelNumBases.fill(0);
         numPeaks = numBases = 0;
     }
     void configure(juce::dsp::FFT* engine, const float* windowPtr,
@@ -48,38 +54,45 @@ public:
         binWidth = binWidth_;
         sampleRate = sampleRate_;
         spectrumNorm = spectrumNorm_;
-        std::fill(scFifo.begin(), scFifo.end(), 0.0f);
-        std::fill(prevPhase.begin(), prevPhase.end(), 0.0f);
-        analysisSeed = true;
-        prevPrimary = 0.0f;
+        for(int channel = 0; channel < maxChannels; ++channel)
+        {
+            std::fill(scFifo[(size_t) channel].begin(), scFifo[(size_t) channel].end(), 0.0f);
+            std::fill(prevPhase[(size_t) channel].begin(), prevPhase[(size_t) channel].end(), 0.0f);
+        }
+        analysisSeed.fill(true);
+        activeChannels = 0;
+        prevPrimary.fill(0.0f);
+        channelNumBases.fill(0);
         numPeaks = numBases = 0;
     }
-    void pushSample(int pos, float s) noexcept
+    void pushSample(int channel, int pos, float sample) noexcept
     {
-        scFifo[(size_t) pos] = s;
+        if(channel >= 0 && channel < maxChannels)
+            scFifo[(size_t) channel][(size_t) pos] = sample;
     }
-    void processHop(int pos, const Params& p) noexcept
+    void processHop(int pos, int numChannels, const Params& p) noexcept
     {
         if(fft == nullptr || window == nullptr || numBins <= 0)
             return;
-        float* fd = fftData.data();
-        for(int i = 0; i < fftSize; ++i)
-            fd[i] = scFifo[(size_t) ((pos + i) & fftMask)] * window[i];
-        fft->performRealOnlyForwardTransform(fd, false);
-        analyze();
-        detect(p);
+        analyzeChannels(pos, numChannels);
+        for(int channel = 0; channel < activeChannels; ++channel)
+        {
+            std::copy(channelMag[(size_t) channel].begin(),
+                       channelMag[(size_t) channel].begin() + numBins, pvMag.begin());
+            std::copy(channelFreq[(size_t) channel].begin(),
+                       channelFreq[(size_t) channel].begin() + numBins, pvFreq.begin());
+            detect(channel, p);
+        }
+        mergeDetectedBases();
         publish(p.pitchRatio);
     }
-    void processBypassHop(int pos) noexcept
+    void processBypassHop(int pos, int numChannels) noexcept
     {
         if(fft == nullptr || window == nullptr || numBins <= 0)
             return;
-        float* fd = fftData.data();
-        for(int i = 0; i < fftSize; ++i)
-            fd[i] = scFifo[(size_t) ((pos + i) & fftMask)] * window[i];
-        fft->performRealOnlyForwardTransform(fd, false);
-        analyze();
+        analyzeChannels(pos, numChannels);
         numBases = 0;
+        channelNumBases.fill(0);
         lastNumBases.store(0, std::memory_order_relaxed);
         publishBypassed();
     }
@@ -95,17 +108,19 @@ public:
     void publishGatedFrame(bool bypassed) noexcept
     {
         auto& s = bridge.startWrite();
+        s.numChannels = activeChannels;
         s.numBins = numBins;
         s.binWidth = binWidth;
         s.sampleRate = sampleRate;
         s.pvBypassed = bypassed;
-        const int nb = juce::jmin(numBins, (int) s.mag.size());
-        for(int j = 0; j < nb; ++j)
-        {
-            s.mag [(size_t) j] = pvMag [(size_t) j] * spectrumNorm;
-            s.freq[(size_t) j] = pvFreq[(size_t) j];
-        }
-        s.numBases = 0;
+        const int nb = juce::jmin(numBins, (int) s.mag[0].size());
+        for(int channel = 0; channel < activeChannels; ++channel)
+            for(int j = 0; j < nb; ++j)
+            {
+                s.mag [(size_t) channel][(size_t) j] = channelMag [(size_t) channel][(size_t) j] * spectrumNorm;
+                s.freq[(size_t) channel][(size_t) j] = channelFreq[(size_t) channel][(size_t) j];
+            }
+        s.numBases.fill(0);
         bridge.publish();
     }
 private:
@@ -126,7 +141,7 @@ private:
         return x - juce::MathConstants<float>::twoPi
                    * std::round(x / juce::MathConstants<float>::twoPi);
     }
-    void analyze() noexcept
+    void analyzeChannel(int channel) noexcept
     {
         float* fd = fftData.data();
         const float twoPi = juce::MathConstants<float>::twoPi;
@@ -136,20 +151,47 @@ private:
         {
             const float re = fd[2 * k];
             const float im = fd[2 * k + 1];
-            pvPhase[(size_t) k] = std::atan2 (im, re);
-            pvMag [(size_t) k] = std::sqrt(re * re + im * im);
+            channelPhase[(size_t) channel][(size_t) k] = std::atan2 (im, re);
+            channelMag [(size_t) channel][(size_t) k] = std::sqrt(re * re + im * im);
         }
-        if(analysisSeed)
+        if(analysisSeed[(size_t) channel])
         {
             for(int k = 0; k < numBins; ++k)
-                prevPhase[(size_t) k] = wrapPhase(pvPhase[(size_t) k] - expectPerBin * (float) k);
-            analysisSeed = false;
+                prevPhase[(size_t) channel][(size_t) k] = wrapPhase(
+                    channelPhase[(size_t) channel][(size_t) k] - expectPerBin * (float) k);
+            analysisSeed[(size_t) channel] = false;
         }
         for(int k = 0; k < numBins; ++k)
         {
-            const float dev = wrapPhase((pvPhase[(size_t) k] - prevPhase[(size_t) k]) - expectPerBin * (float) k);
-            pvFreq[(size_t) k] = (float) k * binWidth + dev * freqScale;
-            prevPhase[(size_t) k] = pvPhase[(size_t) k];
+            const float phase = channelPhase[(size_t) channel][(size_t) k];
+            const float dev = wrapPhase((phase - prevPhase[(size_t) channel][(size_t) k])
+                                         - expectPerBin * (float) k);
+            channelFreq[(size_t) channel][(size_t) k] = (float) k * binWidth + dev * freqScale;
+            prevPhase[(size_t) channel][(size_t) k] = phase;
+        }
+    }
+    void analyzeChannels(int pos, int numChannels) noexcept
+    {
+        activeChannels = juce::jlimit(0, maxChannels, numChannels);
+        float* fd = fftData.data();
+        for(int channel = 0; channel < activeChannels; ++channel)
+        {
+            for(int i = 0; i < fftSize; ++i)
+                fd[i] = scFifo[(size_t) channel][(size_t) ((pos + i) & fftMask)] * window[i];
+            fft->performRealOnlyForwardTransform(fd, false);
+            analyzeChannel(channel);
+        }
+        for(int k = 0; k < numBins; ++k)
+        {
+            int strongestChannel = 0;
+            for(int channel = 1; channel < activeChannels; ++channel)
+                if(channelMag[(size_t) channel][(size_t) k]
+                    > channelMag[(size_t) strongestChannel][(size_t) k])
+                    strongestChannel = channel;
+            pvMag [(size_t) k] = activeChannels > 0
+                ? channelMag [(size_t) strongestChannel][(size_t) k] : 0.0f;
+            pvFreq[(size_t) k] = activeChannels > 0
+                ? channelFreq[(size_t) strongestChannel][(size_t) k] : 0.0f;
         }
     }
     float salience(float F) const noexcept
@@ -173,17 +215,18 @@ private:
         }
         return sal;
     }
-    void detect(const Params& p) noexcept
+    void detect(int channel, const Params& p) noexcept
     {
         numPeaks = 0;
         numBases = 0;
+        channelNumBases[(size_t) channel] = 0;
         const int peakLimit = p.moreBases ? maxPeaks : defaultMaxPeaks;
         const int baseLimit = p.moreBases ? MaxBases : defaultMaxBases;
         const float salienceGateScale = p.moreBases ? 0.85f : 1.0f;
         const float gatedThr = juce::jmax(0.01f, p.thr * salienceGateScale);
         float maxMag = 0.0f;
         for(int k = 0; k < numBins; ++k) maxMag = std::max(maxMag, pvMag[(size_t) k]);
-        if(maxMag < silenceMagFloor) { lastNumBases.store(0, std::memory_order_relaxed); return; }
+        if(maxMag < silenceMagFloor) return;
         const float floorMag = maxMag * peakFloorRel;
         for(int k = 2; k + 2 < numBins && numPeaks < peakLimit; ++k)
         {
@@ -197,7 +240,7 @@ private:
                 ++numPeaks;
             }
         }
-        if(numPeaks == 0) { lastNumBases.store(0, std::memory_order_relaxed); return; }
+        if(numPeaks == 0) return;
         float totalPeak = 0.0f;
         for(int i = 0; i < numPeaks; ++i)
         {
@@ -216,8 +259,8 @@ private:
                 if(Fc < p.fMin || Fc > p.fMax) continue;
                 const float sal = salience(Fc);
                 float score = sal;
-                if(numBases == 0 && prevPrimary > 0.0f
-                    && std::abs(1200.0f * std::log2 (Fc / prevPrimary)) < centsTol)
+                if(numBases == 0 && prevPrimary[(size_t) channel] > 0.0f
+                    && std::abs(1200.0f * std::log2 (Fc / prevPrimary[(size_t) channel])) < centsTol)
                     score *= (1.0f + continuityBias);
                 if(score > bestScore) { bestScore = score; bestSal = sal; bestF = Fc; bestIdx = c; }
             }
@@ -255,8 +298,8 @@ private:
                 if(std::abs(cents) < centsTol) peakWork[(size_t) i] = 0.0f;
             }
         }
-        if(numBases == 0) { lastNumBases.store(0, std::memory_order_relaxed); return; }
-        prevPrimary = baseFreq[0];
+        if(numBases == 0) return;
+        prevPrimary[(size_t) channel] = baseFreq[0];
         const float tonal = juce::jlimit(0.0f, 1.0f,
                                           firstSal / (tonalRefScale * (totalPeak + 1.0e-12f)));
         for(int b = 0; b < numBases; ++b)
@@ -265,44 +308,74 @@ private:
                                 ? juce::jlimit(0.0f, 1.0f, baseSal[(size_t) b] / firstSal) : 0.0f;
             baseConf[(size_t) b] = rel * tonal;
         }
+        channelNumBases[(size_t) channel] = numBases;
+        for(int base = 0; base < numBases; ++base)
+        {
+            channelBaseFreq[(size_t) channel][(size_t) base] = baseFreq[(size_t) base];
+            channelBaseConf[(size_t) channel][(size_t) base] = baseConf[(size_t) base];
+        }
+    }
+    void mergeDetectedBases() noexcept
+    {
+        numBases = 0;
+        for(int channel = 0; channel < activeChannels; ++channel)
+            for(int base = 0; base < channelNumBases[(size_t) channel] && numBases < MaxBases; ++base)
+            {
+                const float candidate = channelBaseFreq[(size_t) channel][(size_t) base];
+                bool duplicate = false;
+                for(int merged = 0; merged < numBases; ++merged)
+                    if(std::abs(1200.0f * std::log2 (candidate / baseFreq[(size_t) merged])) < centsTol)
+                    {
+                        duplicate = true;
+                        break;
+                    }
+                if(! duplicate)
+                    baseFreq[(size_t) numBases++] = candidate;
+            }
         lastNumBases.store(numBases, std::memory_order_relaxed);
     }
     void publish(float pitchRatio) noexcept
     {
         auto& s = bridge.startWrite();
+        s.numChannels = activeChannels;
         s.numBins = numBins;
         s.binWidth = binWidth;
         s.sampleRate = sampleRate;
         s.pvBypassed = false;
-        const int nb = juce::jmin(numBins, (int) s.mag.size());
-        for(int j = 0; j < nb; ++j)
+        const int nb = juce::jmin(numBins, (int) s.mag[0].size());
+        for(int channel = 0; channel < activeChannels; ++channel)
+            for(int j = 0; j < nb; ++j)
+            {
+                s.mag [(size_t) channel][(size_t) j] = channelMag [(size_t) channel][(size_t) j] * spectrumNorm;
+                s.freq[(size_t) channel][(size_t) j] = channelFreq[(size_t) channel][(size_t) j] * pitchRatio;
+            }
+        for(int channel = 0; channel < activeChannels; ++channel)
         {
-            s.mag [(size_t) j] = pvMag [(size_t) j] * spectrumNorm;
-            s.freq[(size_t) j] = pvFreq[(size_t) j] * pitchRatio;
+            s.numBases[(size_t) channel] = channelNumBases[(size_t) channel];
+            for(int base = 0; base < s.numBases[(size_t) channel]; ++base)
+            {
+                s.baseHz [(size_t) channel][(size_t) base] = channelBaseFreq[(size_t) channel][(size_t) base];
+                s.baseConf[(size_t) channel][(size_t) base] = channelBaseConf[(size_t) channel][(size_t) base];
+            }
         }
-        const int nbases = juce::jmin(numBases, (int) s.baseHz.size());
-        for(int i = 0; i < nbases; ++i)
-        {
-            s.baseHz [(size_t) i] = baseFreq[(size_t) i];
-            s.baseConf[(size_t) i] = baseConf[(size_t) i];
-        }
-        s.numBases = nbases;
         bridge.publish();
     }
     void publishBypassed() noexcept
     {
         auto& s = bridge.startWrite();
+        s.numChannels = activeChannels;
         s.numBins = numBins;
         s.binWidth = binWidth;
         s.sampleRate = sampleRate;
         s.pvBypassed = true;
-        const int nb = juce::jmin(numBins, (int) s.mag.size());
-        for(int j = 0; j < nb; ++j)
-        {
-            s.mag [(size_t) j] = pvMag [(size_t) j] * spectrumNorm;
-            s.freq[(size_t) j] = pvFreq[(size_t) j];
-        }
-        s.numBases = 0;
+        const int nb = juce::jmin(numBins, (int) s.mag[0].size());
+        for(int channel = 0; channel < activeChannels; ++channel)
+            for(int j = 0; j < nb; ++j)
+            {
+                s.mag [(size_t) channel][(size_t) j] = channelMag [(size_t) channel][(size_t) j] * spectrumNorm;
+                s.freq[(size_t) channel][(size_t) j] = channelFreq[(size_t) channel][(size_t) j];
+            }
+        s.numBases.fill(0);
         bridge.publish();
     }
     juce::dsp::FFT* fft = nullptr;
@@ -314,15 +387,21 @@ private:
     float binWidth = 0.0f;
     float spectrumNorm = 1.0f;
     double sampleRate = 44100.0;
-    std::vector<float> scFifo;
+    static constexpr int maxChannels = 2;
+    std::array<std::vector<float>, maxChannels> scFifo;
     std::vector<float> fftData;
-    std::vector<float> pvMag, pvFreq, pvPhase, prevPhase;
+    std::vector<float> pvMag, pvFreq;
+    std::array<std::vector<float>, maxChannels> channelMag, channelFreq, channelPhase, prevPhase;
     std::vector<float> peakFreq, peakAmp, peakWork;
     std::vector<float> baseFreq, baseSal, baseConf;
+    std::array<std::array<float, MaxBases>, maxChannels> channelBaseFreq {};
+    std::array<std::array<float, MaxBases>, maxChannels> channelBaseConf {};
+    std::array<int, maxChannels> channelNumBases {};
     int numPeaks = 0;
     int numBases = 0;
-    float prevPrimary = 0.0f;
-    bool analysisSeed = true;
+    std::array<float, maxChannels> prevPrimary {};
+    int activeChannels = 0;
+    std::array<bool, maxChannels> analysisSeed {};
     std::atomic<int> lastNumBases { 0 };
     BridgeType bridge;
 };

@@ -103,23 +103,23 @@ public:
             }
             const juce::Colour baseCol = baseLineColour();
             const float stripAlphaScale = 1.0f - bypassVisualAmt;
-            for(int i = 0; i < snapshot.numBases; ++i)
-            {
-                const float f = snapshot.baseHz[(size_t) i];
-                const float conf = snapshot.baseConf[(size_t) i];
-                if(f <= 0.0f || conf < 0.05f) continue;
-                if(stripAlphaScale < 0.02f)
-                    continue;
-                const float a = juce::jlimit(0.0f, 1.0f, conf * stripAlphaScale);
-                const float x = plotX + freqToX(f, W);
-                for(int gx = 3; gx >= 1; --gx)
+            const int baseChannelCount = juce::jlimit(0, Snapshot::maxChannels, snapshot.numChannels);
+            for(int channel = 0; channel < baseChannelCount; ++channel)
+                for(int i = 0; i < snapshot.numBases[(size_t) channel]; ++i)
                 {
-                    g.setColour(baseCol.withAlpha(0.12f * (float) gx * a));
-                    g.fillRect(x - (float) gx, plotY, 2.0f * (float) gx, H);
+                    const float f = snapshot.baseHz[(size_t) channel][(size_t) i];
+                    const float conf = snapshot.baseConf[(size_t) channel][(size_t) i];
+                    if(f <= 0.0f || conf < 0.05f || stripAlphaScale < 0.02f) continue;
+                    const float a = juce::jlimit(0.0f, 1.0f, conf * stripAlphaScale);
+                    const float x = plotX + freqToX(f, W);
+                    for(int gx = 3; gx >= 1; --gx)
+                    {
+                        g.setColour(baseCol.withAlpha(0.12f * (float) gx * a));
+                        g.fillRect(x - (float) gx, plotY, 2.0f * (float) gx, H);
+                    }
+                    g.setColour(baseCol.withAlpha(a));
+                    g.fillRect(x - 1.0f, plotY, 2.0f, H);
                 }
-                g.setColour(baseCol.withAlpha(a));
-                g.fillRect(x - 1.0f, plotY, 2.0f, H);
-            }
             const float rad = 9.0f * 0.67f;
             const float stroke = rad * 0.33f;
             const float haloPad = rad * 0.45f;
@@ -480,6 +480,7 @@ private:
     static constexpr float disableHandleCornerRadius = 4.0f;
     static constexpr float disableHandleHeightRatio = 0.66f;
     std::vector<float> peak, bright, src;
+    std::vector<juce::uint8> maxRed, maxGreen, maxBlue;
     void resized() override
     {
         const int w = juce::jmax(1, getWidth());
@@ -489,6 +490,9 @@ private:
             peak.assign((size_t) w, 0.0f);
             bright.assign((size_t) w, 0.0f);
             src.assign((size_t) w, 0.0f);
+            maxRed.assign((size_t) w, 0);
+            maxGreen.assign((size_t) w, 0);
+            maxBlue.assign((size_t) w, 0);
             rebuildImage();
         }
     }
@@ -575,33 +579,7 @@ private:
     {
         const int W = heatImage.getWidth();
         if(W <= 0 || (int) peak.size() != W) return;
-        std::fill(peak.begin(), peak.end(), 0.0f);
         const int reach = (int) std::ceil(splatHalfPx);
-        for(int j = 0; j < snapshot.numBins; ++j)
-        {
-            const float f = snapshot.freq[(size_t) j];
-            if(f <= 0.0f) continue;
-            const float pos = freqPos(f);
-            if(pos < 0.0f || pos > 1.0f) continue;
-            const float m = snapshot.mag[(size_t) j];
-            const float fx = pos * (float) (W - 1);
-            const int c = (int) std::floor(fx);
-            for(int d = -reach; d <= reach + 1; ++d)
-            {
-                const int px = c + d;
-                if(px < 0 || px >= W) continue;
-                const float wgt = splatProfile(std::abs((float) px - fx));
-                if(wgt <= 0.0f) continue;
-                peak[(size_t) px] = std::max(peak[(size_t) px], m * wgt);
-            }
-        }
-        for(int x = 0; x < W; ++x)
-        {
-            const float amp = juce::jmax(0.0f, peak[(size_t) x]);
-            const float db = 20.0f * std::log10 (juce::jmax(amp, 1.0e-9f));
-            const float norm = juce::jlimit(0.0f, 1.0f, (db + 60.0f) / 60.0f);
-            bright[(size_t) x] = norm * std::sqrtf(norm);
-        }
         constexpr int R = 8;
         constexpr float sigma = 4.0f;
         constexpr float glowExp = 3.0f;
@@ -609,24 +587,63 @@ private:
         std::array<float, (size_t) (2 * R + 1)> kernel {};
         for(int k = -R; k <= R; ++k)
             kernel[(size_t) (k + R)] = std::exp(-(float) (k * k) / (2.0f * sigma * sigma));
-        for(int x = 0; x < W; ++x)
-            src[(size_t) x] = std::pow(bright[(size_t) x], glowExp);
+        std::fill(maxRed.begin(), maxRed.end(), 0);
+        std::fill(maxGreen.begin(), maxGreen.end(), 0);
+        std::fill(maxBlue.begin(), maxBlue.end(), 0);
+        const int channelCount = juce::jlimit(0, Snapshot::maxChannels, snapshot.numChannels);
+        for(int channel = 0; channel < channelCount; ++channel)
+        {
+            std::fill(peak.begin(), peak.end(), 0.0f);
+            for(int j = 0; j < snapshot.numBins; ++j)
+            {
+                const float f = snapshot.freq[(size_t) channel][(size_t) j];
+                if(f <= 0.0f) continue;
+                const float pos = freqPos(f);
+                if(pos < 0.0f || pos > 1.0f) continue;
+                const float m = snapshot.mag[(size_t) channel][(size_t) j];
+                const float fx = pos * (float) (W - 1);
+                const int c = (int) std::floor(fx);
+                for(int d = -reach; d <= reach + 1; ++d)
+                {
+                    const int px = c + d;
+                    if(px < 0 || px >= W) continue;
+                    const float wgt = splatProfile(std::abs((float) px - fx));
+                    if(wgt > 0.0f)
+                        peak[(size_t) px] = std::max(peak[(size_t) px], m * wgt);
+                }
+            }
+            for(int x = 0; x < W; ++x)
+            {
+                const float amp = juce::jmax(0.0f, peak[(size_t) x]);
+                const float db = 20.0f * std::log10 (juce::jmax(amp, 1.0e-9f));
+                const float norm = juce::jlimit(0.0f, 1.0f, (db + 60.0f) / 60.0f);
+                bright[(size_t) x] = norm * std::sqrtf(norm);
+                src[(size_t) x] = std::pow(bright[(size_t) x], glowExp);
+            }
+            for(int x = 0; x < W; ++x)
+            {
+                float glow = 0.0f;
+                for(int k = -R; k <= R; ++k)
+                {
+                    const int sx = x + k;
+                    if(sx >= 0 && sx < W)
+                        glow += kernel[(size_t) (k + R)] * src[(size_t) sx];
+                }
+                const float g = juce::jlimit(0.0f, 1.0f, glowGain * glow);
+                const float b = bright[(size_t) x];
+                const auto value = (juce::uint8) juce::jlimit(0, 255,
+                    (int) std::lround((b + (1.0f - b) * g) * 255.0f));
+                const juce::Colour channelColour(value, value, value);
+                maxRed [(size_t) x] = juce::jmax(maxRed [(size_t) x], channelColour.getRed());
+                maxGreen[(size_t) x] = juce::jmax(maxGreen[(size_t) x], channelColour.getGreen());
+                maxBlue [(size_t) x] = juce::jmax(maxBlue [(size_t) x], channelColour.getBlue());
+            }
+        }
         juce::Image::BitmapData bd(heatImage, juce::Image::BitmapData::writeOnly);
         for(int x = 0; x < W; ++x)
-        {
-            float glow = 0.0f;
-            for(int k = -R; k <= R; ++k)
-            {
-                const int sx = x + k;
-                if(sx < 0 || sx >= W) continue;
-                glow += kernel[(size_t) (k + R)] * src[(size_t) sx];
-            }
-            const float g = juce::jlimit(0.0f, 1.0f, glowGain * glow);
-            const float b = bright[(size_t) x];
-            const float lit = b + (1.0f - b) * g;
-            const auto v = (juce::uint8) juce::jlimit(0, 255, (int) std::lround(lit * 255.0f));
-            bd.setPixelColour(x, 0, juce::Colour(v, v, v));
-        }
+            bd.setPixelColour(x, 0, juce::Colour(maxRed[(size_t) x],
+                                                   maxGreen[(size_t) x],
+                                                   maxBlue[(size_t) x]));
     }
     void drawInwardGlow(juce::Graphics& g, float edgeX, float towardX, float plotY, float H,
                          juce::Colour colour)
