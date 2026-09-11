@@ -363,6 +363,7 @@ private:
     SmoothTextButton midSideBtn { "LEFT - RIGHT" };
     SmoothComboBox modeBox;
     ValueKnob envComp;
+    ValueKnob oddEvenBalance;
     ValueKnob formant;
     ValueKnob transient;
     ValueKnob transpose, attraction, emphasis, morph, density, feedback, fineTune, scTranspose;
@@ -386,12 +387,14 @@ private:
     MouseSpy mouseSpy { *this };
     juce::Label fftLbl, overlapLbl, stereoLbl, formantLbl, transientLbl, transposeLbl,
                 attractionLbl, emphasisLbl, morphLbl, densityLbl, feedbackLbl, fineTuneLbl, envCompLbl,
+                oddEvenBalanceLbl,
                 scTransposeLbl, targetLbl;
     std::unique_ptr<CA> fftAtt, overlapAtt, modeAtt;
     std::unique_ptr<BA> bypassAtt, fullMidiAtt, moreBasesAtt, midSideAtt, hysteresisAtt;
     std::unique_ptr<BA> enhanceTransientAtt;
     std::unique_ptr<SA> transientAtt, transposeAtt, attractionAtt, emphasisAtt,
-                        morphAtt, densityAtt, feedbackAtt, fineTuneAtt, envCompAtt, scTransposeAtt;
+                        morphAtt, densityAtt, feedbackAtt, fineTuneAtt, envCompAtt, oddEvenBalanceAtt,
+                        scTransposeAtt;
     std::unique_ptr<SA> formantAtt;
     ValueReadout valueReadout;
     ValueKnob* readoutKnob = nullptr;
@@ -489,7 +492,7 @@ private:
                 auto row = panelRect.reduced(24, 0).withTop(logoRect.getBottom() + 4).withHeight(18);
                 g.setColour(juce::Colour(0xffc4c4cc));
                 g.setFont(KnobLookAndFeel::courier(KnobLookAndFeel::uiFont));
-                g.drawText("           Version 1.1.4", row, juce::Justification::centredLeft, false);
+                g.drawText("           Version 1.1.5", row, juce::Justification::centredLeft, false);
                 g.drawText("By Project Alletis           ", row, juce::Justification::centredRight, false);
             }
             const float arrowA = 0.35f + 0.65f * pageAlpha;

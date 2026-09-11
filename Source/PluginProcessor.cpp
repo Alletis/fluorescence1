@@ -55,6 +55,7 @@ FluorescenceAudioProcessor::FluorescenceAudioProcessor()
     feedbackParam = apvts.getRawParameterValue("feedback");
     fineTuneParam = apvts.getRawParameterValue("fineTune");
     envCompParam = apvts.getRawParameterValue("envComp");
+    oddEvenBalanceParam = apvts.getRawParameterValue("oddEvenBalance");
     disableFreqLoParam = apvts.getRawParameterValue("disableFreqLo");
     disableFreqHiParam = apvts.getRawParameterValue("disableFreqHi");
     disableActiveLoParam = apvts.getRawParameterValue("disableActiveLo");
@@ -139,6 +140,9 @@ FluorescenceAudioProcessor::createLayout()
     params.push_back(std::make_unique<juce::AudioParameterFloat>(
         juce::ParameterID { "envComp", 1 }, "Compensation",
         juce::NormalisableRange<float> { -0.25f, 1.0f, 0.0f }, 0.0f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>(
+        juce::ParameterID { "oddEvenBalance", 1 }, "Odd / Even",
+        juce::NormalisableRange<float> { -1.0f, 1.0f, 0.0f }, 0.0f));
     juce::NormalisableRange<float> disableFreqRange { 20.0f, 20000.0f, 0.0f };
     disableFreqRange.setSkewForCentre(std::sqrt(20.0f * 20000.0f));
     params.push_back(std::make_unique<juce::AudioParameterFloat>(
@@ -223,6 +227,7 @@ void FluorescenceAudioProcessor::prepareToPlay(double sr, int)
     dstHitCount.assign(maxBins, 0.0f);
     dstRetuneWeight.assign(maxBins, 0.0f);
     dstRetunePeak.assign(maxBins, 0.0f);
+    binHarmonic.assign(maxBins, 0);
     feedbackAddedMag.assign(maxBins, 0.0f);
     preFeedbackMag.assign(maxBins, 0.0f);
     accRe.assign(maxBins, 0.0f);
@@ -1529,9 +1534,14 @@ void FluorescenceAudioProcessor::detect(int channel)
     {
         binDestFreq[(size_t) k] = pvFreq[(size_t) k] * pitchRatio;
         binTargetAffinity[(size_t) k] = 0.0f;
+        binHarmonic[(size_t) k] = 0;
         maxMag = std::max(maxMag, pvMag[(size_t) k]);
     }
     const bool remap = frame.remap;
+    const float oddEvenBalance = oddEvenBalanceParam != nullptr
+        ? juce::jlimit(-1.0f, 1.0f, oddEvenBalanceParam->load())
+        : 0.0f;
+    const bool classifyHarmonics = remap || std::abs(oddEvenBalance) > 1.0e-6f;
     const int peakLimit = frame.peakLimit;
     const int baseLimit = frame.baseLimit;
     const float gatedThr = frame.gatedThreshold;
@@ -1859,7 +1869,7 @@ void FluorescenceAudioProcessor::detect(int channel)
     }
     rebuildFlatBaseCandidates();
     rebuildHarmonicPeakList(channel, maxMag);
-    if(! remap)
+    if(! classifyHarmonics)
         return;
     if(numBases == 0)
         return;
@@ -1971,6 +1981,8 @@ void FluorescenceAudioProcessor::detect(int channel)
         const float bDev = std::abs(1200.0f * (Lfkb - baseLog2Hz[(size_t) bBase] - LbN));
         const float gapCentsB = (bN <= harmonicsTagMax) ? gapCentsTable[(size_t) bN]
                                                         : 1200.0f * std::log2 ((float)(bN + 1) / (float) bN);
+        if(bDev <= harmonicAssignmentTolerance(bN, fkb))
+            binHarmonic[(size_t) k] = bN;
         const float sigNb = shiftGapFrac * gapCentsB * sigmaScaleB;
         const float zb = bDev / juce::jmax(1.0e-3f, sigNb);
         const float wProxb = std::exp(-(zb * zb));
@@ -2497,6 +2509,9 @@ void FluorescenceAudioProcessor::mapToDestination(int channel)
     }
     const auto& bypassMask = transientBypassMask[(size_t) channel];
     const float invBinWidth = 1.0f / juce::jmax(1.0e-6f, binWidth);
+    const float oddEvenBalance = oddEvenBalanceParam != nullptr
+        ? juce::jlimit(-1.0f, 1.0f, oddEvenBalanceParam->load())
+        : 0.0f;
     for(int k = 0; k < numBins; ++k)
     {
         if(bypassMask[(size_t) k] != 0)
@@ -2510,7 +2525,8 @@ void FluorescenceAudioProcessor::mapToDestination(int channel)
         const int j = (int) std::lround(destinationBin);
         if(j >= 0 && j < numBins)
         {
-            const float m = pvMag[(size_t) k];
+            const float m = pvMag[(size_t) k]
+                          * oddEvenGain(binHarmonic[(size_t) k], oddEvenBalance);
             dstMag[(size_t) j] += m;
             dstFreqNum[(size_t) j] += m * destinationHz;
             dstHitCount[(size_t) j] += 1.0f;
@@ -2766,6 +2782,9 @@ void FluorescenceAudioProcessor::updateTimeAdditiveVoices(int channel)
     auto& voices = timeVoices[(size_t) channel];
     auto& parts = partials[(size_t) channel];
     const auto& bypassMask = transientBypassMask[(size_t) channel];
+    const float oddEvenBalance = oddEvenBalanceParam != nullptr
+        ? juce::jlimit(-1.0f, 1.0f, oddEvenBalanceParam->load())
+        : 0.0f;
     auto analysisFreqBypassed = [&] (float analysisHz)
     {
         if(analysisHz <= 0.0f || numBins <= 0 || binWidth <= 0.0f)
@@ -2832,7 +2851,8 @@ void FluorescenceAudioProcessor::updateTimeAdditiveVoices(int channel)
         it->targetFrequency = juce::jlimit(
             0.0f, (float) (0.5 * sampleRate), partial.freqOut);
         it->sourceAmplitude = juce::jmax(0.0f, partial.timeTargetAmp)
-                            * juce::jlimit(0.0f, 1.0f, partial.timeOwnership);
+                            * juce::jlimit(0.0f, 1.0f, partial.timeOwnership)
+                            * oddEvenGain(partial.harmonic, oddEvenBalance);
         it->sourceRetune = std::sqrt(juce::jlimit(0.0f, 1.0f, partial.targetAffinity));
         it->sourceFrequency = juce::jmax(0.0f, partial.freqNat);
     }

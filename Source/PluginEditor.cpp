@@ -104,6 +104,7 @@ FluorescenceAudioProcessorEditor::FluorescenceAudioProcessorEditor(FluorescenceA
     setupKnob(feedback, "feedback", feedbackAtt);
     setupKnob(fineTune, "fineTune", fineTuneAtt);
     setupKnob(envComp, "envComp", envCompAtt);
+    setupKnob(oddEvenBalance, "oddEvenBalance", oddEvenBalanceAtt);
     setupKnob(formant, "formant", formantAtt);
     transpose.setSliderStyle(juce::Slider::LinearHorizontal);
     transpose.setSliderSnapsToMousePosition(false);
@@ -123,6 +124,11 @@ FluorescenceAudioProcessorEditor::FluorescenceAudioProcessorEditor(FluorescenceA
     envComp.setWheelStep(0.05);
     envComp.setLinearTrackEndCap(ValueKnob::LinearEndCap::BothRounded);
     envComp.setLinearFillEndCap(ValueKnob::LinearEndCap::LeftRounded);
+    oddEvenBalance.setSliderStyle(juce::Slider::LinearHorizontal);
+    oddEvenBalance.setSliderSnapsToMousePosition(false);
+    oddEvenBalance.setWheelStep(0.05);
+    oddEvenBalance.setLinearTrackEndCap(ValueKnob::LinearEndCap::BothRounded);
+    oddEvenBalance.setLinearFillEndCap(ValueKnob::LinearEndCap::BothRounded);
     formant.setSliderStyle(juce::Slider::LinearHorizontal);
     formant.setSliderSnapsToMousePosition(false);
     formant.setWheelStep(1.0);
@@ -148,6 +154,7 @@ FluorescenceAudioProcessorEditor::FluorescenceAudioProcessorEditor(FluorescenceA
     styleLabel(feedbackLbl, "FEEDBACK");
     styleLabel(fineTuneLbl, "FINE TUNE");
     styleLabel(envCompLbl, "COMPENSATION");
+    styleLabel(oddEvenBalanceLbl, "ODD / EVEN");
     styleLabel(formantLbl, "FORMANT");
     styleLabel(targetLbl, "TARGETS");
     content.addChildComponent(valueReadout);
@@ -161,6 +168,7 @@ FluorescenceAudioProcessorEditor::FluorescenceAudioProcessorEditor(FluorescenceA
     wireReadout(feedback, feedbackLbl);
     wireReadout(fineTune, fineTuneLbl);
     wireReadout(envComp, envCompLbl);
+    wireReadout(oddEvenBalance, oddEvenBalanceLbl);
     wireReadout(formant, formantLbl);
     content.addChildComponent(flyoutA);
     flyoutA.addAndMakeVisible(transient);
@@ -178,6 +186,8 @@ FluorescenceAudioProcessorEditor::FluorescenceAudioProcessorEditor(FluorescenceA
     flyoutA.addAndMakeVisible(formant);
     flyoutA.addAndMakeVisible(envCompLbl);
     flyoutA.addAndMakeVisible(envComp);
+    flyoutA.addAndMakeVisible(oddEvenBalanceLbl);
+    flyoutA.addAndMakeVisible(oddEvenBalance);
     flyoutA.addAndMakeVisible(enhanceTransientBtn);
     flyoutA.addAndMakeVisible(rendererModeBtn);
     enhanceTransientAtt = std::make_unique<BA> (p.apvts, "enhanceTransient", enhanceTransientBtn);
@@ -464,6 +474,7 @@ juce::Label* FluorescenceAudioProcessorEditor::findReadoutLabelForKnob(ValueKnob
     if(knob == &feedback) return &feedbackLbl;
     if(knob == &fineTune) return &fineTuneLbl;
     if(knob == &envComp) return &envCompLbl;
+    if(knob == &oddEvenBalance) return &oddEvenBalanceLbl;
     if(knob == &formant) return &formantLbl;
     return nullptr;
 }
@@ -511,7 +522,7 @@ void FluorescenceAudioProcessorEditor::handleGlobalMouseMove(const juce::MouseEv
     {
         const auto p = e.getEventRelativeTo(&content).position.toInt();
         if(logoArea.contains(p))
-            hintText = "-\n\nVersion: 1.1.4";
+            hintText = "-\n\nVersion: 1.1.5";
     }
     hoverHintBox.setHintText(hintText);
     ValueKnob* knob = nullptr;
@@ -582,6 +593,7 @@ juce::String FluorescenceAudioProcessorEditor::findHoverHintTextForComponent(juc
         if(c == &feedback) return "Feedback\n\nBoosts retuned fundamentals and their harmonics shifted near targets.";
         if(c == &fineTune) return "Fine Tune\n\nAmount in cents to shift the target notes by.";
         if(c == &envComp) return "Compensation\n\nPositive values flatten the synthesised magnitude response, while negative values exaggerate them.";
+        if(c == &oddEvenBalance) return "Odd / Even\n\nIsolates odd or even harmonics of each detected fundamental.";
         if(c == &pianoRoll) return "Piano Roll\n\nScale: \nClick notes here to modify the target scale.\n\nMIDI: \nDisplays the current MIDI input.";
         if(c == &spectrum || c == &spectrumCoordOverlay) return "Spectrum (Main)\n\nDisplays Phase-Vocoder frequencies and detected fundamentals.\nDrag your mouse on the spectrum to change detection range.\n\nLeft-Right: Centre\nUp-Down: Spread";
         if(c == &scSpectrum || c == &scSpectrumCoordOverlay) return "Spectrum (Sidechain)\n\nDisplays Phase-Vocoder frequencies and detected fundamentals for sidechain input.\n\nSee Main Spectrum for more detail.";
@@ -868,9 +880,18 @@ void FluorescenceAudioProcessorEditor::resized()
         formant.setBounds(inner.removeFromTop(24));
         formant.setMouseDragSensitivity(juce::jmax(1, formant.getWidth()));
         inner.removeFromTop(5);
-        envCompLbl.setBounds(inner.removeFromTop(labelH));
-        envComp.setBounds(inner.removeFromTop(24));
+        auto balanceLabels = inner.removeFromTop(labelH);
+        auto balanceControls = inner.removeFromTop(24);
+        const int balanceGap = 8;
+        const int balanceLeftW = (balanceControls.getWidth() - balanceGap) / 2;
+        envCompLbl.setBounds(balanceLabels.removeFromLeft(balanceLeftW));
+        balanceLabels.removeFromLeft(balanceGap);
+        oddEvenBalanceLbl.setBounds(balanceLabels);
+        envComp.setBounds(balanceControls.removeFromLeft(balanceLeftW));
+        balanceControls.removeFromLeft(balanceGap);
+        oddEvenBalance.setBounds(balanceControls);
         envComp.setMouseDragSensitivity(juce::jmax(1, envComp.getWidth()));
+        oddEvenBalance.setMouseDragSensitivity(juce::jmax(1, oddEvenBalance.getWidth()));
         inner.removeFromTop(rowGap);
         auto ov = inner.removeFromTop(ovH);
         overlapLbl.setBounds(ov.removeFromTop(labelH));

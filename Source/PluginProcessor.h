@@ -62,6 +62,14 @@ private:
     void updateTimeAdditiveVoices(int channel);
     float estimateTimeAdditiveAmplitude(int peakIndex) const;
     bool isTimeAdditiveEnabled() const noexcept;
+    static float oddEvenGain(int harmonic, float balance) noexcept
+    {
+        if(harmonic < 1)
+            return 1.0f;
+        return((harmonic & 1) != 0)
+            ? 1.0f - juce::jmax(0.0f, balance)
+            : 1.0f + juce::jmin(0.0f, balance);
+    }
     float detectTransient(int channel);
     void captureSpectrum(int channel);
     void publishSpectrum(int numChannels);
@@ -224,6 +232,7 @@ private:
     std::vector<float> dstHitCount;
     std::vector<float> dstRetuneWeight;
     std::vector<float> dstRetunePeak;
+    std::vector<int> binHarmonic;
     std::vector<float> feedbackAddedMag;
     std::vector<float> preFeedbackMag;
     std::vector<float> envRefPrefix, envOutPrefix, envAppliedGain;
@@ -420,6 +429,7 @@ private:
     std::atomic<float>* feedbackParam = nullptr;
     std::atomic<float>* fineTuneParam = nullptr;
     std::atomic<float>* envCompParam = nullptr;
+    std::atomic<float>* oddEvenBalanceParam = nullptr;
     std::atomic<float>* disableFreqLoParam = nullptr;
     std::atomic<float>* disableFreqHiParam = nullptr;
     std::atomic<float>* disableActiveLoParam = nullptr;
