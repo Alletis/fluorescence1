@@ -234,6 +234,7 @@ private:
     std::vector<float> dstRetunePeak;
     std::vector<float> dstParityGainNum;
     std::vector<int> binHarmonic;
+    std::vector<float> binParityMembership;
     std::vector<float> feedbackAddedMag;
     std::vector<float> preFeedbackMag;
     std::vector<float> envRefPrefix, envOutPrefix, envAppliedGain;

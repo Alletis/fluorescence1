@@ -229,6 +229,7 @@ void FluorescenceAudioProcessor::prepareToPlay(double sr, int)
     dstRetunePeak.assign(maxBins, 0.0f);
     dstParityGainNum.assign(maxBins, 0.0f);
     binHarmonic.assign(maxBins, 0);
+    binParityMembership.assign(maxBins, 0.0f);
     feedbackAddedMag.assign(maxBins, 0.0f);
     preFeedbackMag.assign(maxBins, 0.0f);
     accRe.assign(maxBins, 0.0f);
@@ -1536,6 +1537,7 @@ void FluorescenceAudioProcessor::detect(int channel)
         binDestFreq[(size_t) k] = pvFreq[(size_t) k] * pitchRatio;
         binTargetAffinity[(size_t) k] = 0.0f;
         binHarmonic[(size_t) k] = 0;
+        binParityMembership[(size_t) k] = 0.0f;
         maxMag = std::max(maxMag, pvMag[(size_t) k]);
     }
     const bool remap = frame.remap;
@@ -1982,8 +1984,6 @@ void FluorescenceAudioProcessor::detect(int channel)
         const float bDev = std::abs(1200.0f * (Lfkb - baseLog2Hz[(size_t) bBase] - LbN));
         const float gapCentsB = (bN <= harmonicsTagMax) ? gapCentsTable[(size_t) bN]
                                                         : 1200.0f * std::log2 ((float)(bN + 1) / (float) bN);
-        if(bDev <= harmonicAssignmentTolerance(bN, fkb))
-            binHarmonic[(size_t) k] = bN;
         const float sigNb = shiftGapFrac * gapCentsB * sigmaScaleB;
         const float zb = bDev / juce::jmax(1.0e-3f, sigNb);
         const float wProxb = std::exp(-(zb * zb));
@@ -1998,8 +1998,27 @@ void FluorescenceAudioProcessor::detect(int channel)
         const float Lideal = LbN + baseSnapLog2Hz[(size_t) bBase];
         const float Lcorrected = LfkFollow + t * (Lideal - LfkFollow);
         const float Ldest = Lfkb + appliedWb * (Lcorrected - Lfkb);
-        binDestFreq[(size_t) k] = std::exp2 (Ldest);
+        const float destinationHz = std::exp2 (Ldest);
+        binDestFreq[(size_t) k] = destinationHz;
         binTargetAffinity[(size_t) k] = baseAffinityV[(size_t) bBase];
+        const float destinationDeviation = 1200.0f * std::abs(Ldest - Lideal);
+        const float upperGap = gapCentsB;
+        const float lowerGap = (bN > 1)
+            ? 1200.0f * std::log2((float) bN / (float) (bN - 1))
+            : upperGap;
+        const float halfGapLimit = 0.45f * juce::jmin(lowerGap, upperGap);
+        const float outerWidth = juce::jmin(
+            harmonicAssignmentTolerance(bN, destinationHz), halfGapLimit);
+        if(destinationDeviation < outerWidth)
+        {
+            const float innerWidth = 0.20f * outerWidth;
+            const float edge = juce::jlimit(0.0f, 1.0f,
+                (destinationDeviation - innerWidth)
+                    / juce::jmax(1.0e-3f, outerWidth - innerWidth));
+            const float smoothEdge = edge * edge * (3.0f - 2.0f * edge);
+            binHarmonic[(size_t) k] = bN;
+            binParityMembership[(size_t) k] = 1.0f - smoothEdge;
+        }
     }
   }
 float FluorescenceAudioProcessor::baseFrequencyForEncodedIndex(int baseIdx) const
@@ -2531,8 +2550,10 @@ void FluorescenceAudioProcessor::mapToDestination(int channel)
             dstMag[(size_t) j] += m;
             dstFreqNum[(size_t) j] += m * destinationHz;
             dstHitCount[(size_t) j] += 1.0f;
-            dstParityGainNum[(size_t) j] += m
-                * oddEvenGain(binHarmonic[(size_t) k], oddEvenBalance);
+            const float parityGain = oddEvenGain(binHarmonic[(size_t) k], oddEvenBalance);
+            const float membership = binParityMembership[(size_t) k];
+            const float taperedGain = 1.0f - membership * (1.0f - parityGain);
+            dstParityGainNum[(size_t) j] += m * taperedGain;
             if(feedbackActive)
             {
                 const float srcHz = sourceFrequency * pitchRatio;
