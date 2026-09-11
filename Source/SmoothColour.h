@@ -21,14 +21,47 @@ struct SmoothColour
 struct SmoothValue
 {
     double v = 0.0;
+    double activeTarget = 0.0;
     bool primed = false;
-    void prime(double target) { v = target; primed = true; }
+    bool moving = false;
+    void prime(double target)
+    {
+        v = activeTarget = target;
+        primed = true;
+        moving = false;
+    }
     bool approach(double target, double rate, double eps)
     {
-        if(! primed) { v = target; primed = true; return false; }
-        const double d = target - v;
+        if(! primed)
+        {
+            prime(target);
+            return false;
+        }
+        if(std::abs(target - activeTarget) > eps)
+        {
+            if(moving)
+                v = activeTarget;
+            activeTarget = target;
+            moving = std::abs(activeTarget - v) > eps;
+        }
+        const double d = activeTarget - v;
+        if(std::abs(d) <= eps)
+        {
+            v = activeTarget;
+            moving = false;
+            return false;
+        }
         v += d * rate;
-        return std::abs(d) > eps;
+        if(std::abs(activeTarget - v) <= eps)
+        {
+            v = activeTarget;
+            moving = false;
+        }
+        else
+        {
+            moving = true;
+        }
+        return true;
     }
     double get() const { return v; }
 };

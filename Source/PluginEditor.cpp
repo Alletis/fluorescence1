@@ -121,14 +121,14 @@ FluorescenceAudioProcessorEditor::FluorescenceAudioProcessorEditor(FluorescenceA
     fineTune.setWheelStep(25.0);
     envComp.setSliderStyle(juce::Slider::LinearHorizontal);
     envComp.setSliderSnapsToMousePosition(false);
-    envComp.setWheelStep(0.05);
+    envComp.setWheelStep(0.25);
     envComp.setLinearTrackEndCap(ValueKnob::LinearEndCap::BothRounded);
-    envComp.setLinearFillEndCap(ValueKnob::LinearEndCap::LeftRounded);
+    envComp.setLinearFillEndCap(ValueKnob::LinearEndCap::Square);
     oddEvenBalance.setSliderStyle(juce::Slider::LinearHorizontal);
     oddEvenBalance.setSliderSnapsToMousePosition(false);
-    oddEvenBalance.setWheelStep(0.05);
+    oddEvenBalance.setWheelStep(0.25);
     oddEvenBalance.setLinearTrackEndCap(ValueKnob::LinearEndCap::BothRounded);
-    oddEvenBalance.setLinearFillEndCap(ValueKnob::LinearEndCap::BothRounded);
+    oddEvenBalance.setLinearFillEndCap(ValueKnob::LinearEndCap::Square);
     formant.setSliderStyle(juce::Slider::LinearHorizontal);
     formant.setSliderSnapsToMousePosition(false);
     formant.setWheelStep(1.0);

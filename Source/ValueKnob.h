@@ -90,6 +90,9 @@ public:
     double snapStep = 0.0;
     juce::String getTextFromValue(double value) override
     {
+        const double roundingThreshold = 0.5 * std::pow(10.0, -(double) displayDecimals);
+        if(std::abs(value) < roundingThreshold)
+            value = 0.0;
         if(displayDecimals == 0)
             return juce::String((int) std::lround(value)) + getTextValueSuffix();
         return juce::String(value, displayDecimals) + getTextValueSuffix();
