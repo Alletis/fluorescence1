@@ -232,6 +232,7 @@ private:
     std::vector<float> dstHitCount;
     std::vector<float> dstRetuneWeight;
     std::vector<float> dstRetunePeak;
+    std::vector<float> dstParityGainNum;
     std::vector<int> binHarmonic;
     std::vector<float> feedbackAddedMag;
     std::vector<float> preFeedbackMag;

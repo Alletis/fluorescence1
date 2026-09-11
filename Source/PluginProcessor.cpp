@@ -227,6 +227,7 @@ void FluorescenceAudioProcessor::prepareToPlay(double sr, int)
     dstHitCount.assign(maxBins, 0.0f);
     dstRetuneWeight.assign(maxBins, 0.0f);
     dstRetunePeak.assign(maxBins, 0.0f);
+    dstParityGainNum.assign(maxBins, 0.0f);
     binHarmonic.assign(maxBins, 0);
     feedbackAddedMag.assign(maxBins, 0.0f);
     preFeedbackMag.assign(maxBins, 0.0f);
@@ -2483,6 +2484,7 @@ void FluorescenceAudioProcessor::mapToDestination(int channel)
     std::fill(dstMag.begin(), dstMag.begin() + numBins, 0.0f);
     std::fill(dstFreqNum.begin(), dstFreqNum.begin() + numBins, 0.0f);
     std::fill(dstHitCount.begin(), dstHitCount.begin() + numBins, 0.0f);
+    std::fill(dstParityGainNum.begin(), dstParityGainNum.begin() + numBins, 0.0f);
     const float feedbackAmount = (feedbackParam != nullptr)
         ? juce::jlimit(0.0f, 1.0f, feedbackParam->load())
         : 0.0f;
@@ -2525,11 +2527,12 @@ void FluorescenceAudioProcessor::mapToDestination(int channel)
         const int j = (int) std::lround(destinationBin);
         if(j >= 0 && j < numBins)
         {
-            const float m = pvMag[(size_t) k]
-                          * oddEvenGain(binHarmonic[(size_t) k], oddEvenBalance);
+            const float m = pvMag[(size_t) k];
             dstMag[(size_t) j] += m;
             dstFreqNum[(size_t) j] += m * destinationHz;
             dstHitCount[(size_t) j] += 1.0f;
+            dstParityGainNum[(size_t) j] += m
+                * oddEvenGain(binHarmonic[(size_t) k], oddEvenBalance);
             if(feedbackActive)
             {
                 const float srcHz = sourceFrequency * pitchRatio;
@@ -2547,6 +2550,18 @@ void FluorescenceAudioProcessor::mapToDestination(int channel)
         }
     }
     applyEnvelopeCompensation();
+    for(int j = 0; j < numBins; ++j)
+    {
+        const float unsuppressedMag = dstMag[(size_t) j];
+        if(unsuppressedMag <= 0.0f)
+            continue;
+        const float envelopeGain = envAppliedGain[(size_t) j];
+        const float preCompMag = unsuppressedMag / juce::jmax(1.0e-9f, envelopeGain);
+        const float parityGain = juce::jlimit(0.0f, 1.0f,
+            dstParityGainNum[(size_t) j] / juce::jmax(1.0e-9f, preCompMag));
+        dstMag[(size_t) j] *= parityGain;
+        dstFreqNum[(size_t) j] *= parityGain;
+    }
     if(feedbackActive)
     {
         const float holdDecay = 0.60f + 0.395f * feedbackAmount;
