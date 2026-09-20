@@ -78,6 +78,13 @@ public:
         startTimerHz(60);
     }
     ~HoverHintBox() override { stopTimer(); }
+    void startFirstOpenFlash()
+    {
+        firstOpenFlashActive = true;
+        firstOpenFlashStartMs = juce::Time::getMillisecondCounterHiRes();
+        repaint();
+    }
+    void cancelFirstOpenFlash() noexcept { firstOpenFlashActive = false; }
     void setHintText(juce::String t)
     {
         auto next = t.trim();
@@ -141,6 +148,8 @@ public:
     {
         const auto r = getLocalBounds().toFloat().reduced(0.5f);
         const bool inZone = getToggleHitRect(r).contains(e.position);
+        if(inZone)
+            cancelFirstOpenFlash();
         if(inZone != toggleHot)
         {
             toggleHot = inZone;
@@ -190,14 +199,36 @@ private:
         const float heightPhaseSpan = 1.5f;
         const float textPhaseStart = heightPhaseSpan;
         const float textPhaseSpan = 2.0f - textPhaseStart;
-        const auto bgT = juce::Colour(0xff17171c);
-        const auto borderT = juce::Colour(0xff34343e);
-        const auto textT = juce::Colour(0xffb0b0b8);
+        auto bgT = juce::Colour(0xff17171c);
+        auto borderT = juce::Colour(0xff34343e);
+        auto textT = juce::Colour(0xffb0b0b8);
         auto handleT = collapsed ? juce::Colour(0xff8a8a92) : juce::Colour(0xff45aeb1);
-        if(toggleHot)
-            handleT = handleT.brighter(0.28f);
-        if(toggleDown)
-            handleT = handleT.darker(0.35f);
+        if(firstOpenFlashActive)
+        {
+            constexpr double totalMs = 2600.0;
+            constexpr double pulseMs = 650.0;
+            const double elapsedMs = juce::Time::getMillisecondCounterHiRes() - firstOpenFlashStartMs;
+            if(elapsedMs >= totalMs)
+            {
+                firstOpenFlashActive = false;
+            }
+            else
+            {
+                const double phase = std::fmod(elapsedMs, pulseMs) / pulseMs;
+                const float pulse = 0.5f - 0.5f * std::cos((float) phase
+                                                          * juce::MathConstants<float>::twoPi);
+                const auto normal = juce::Colour(0xff8a8a92);
+                const auto bright = juce::Colours::white;
+                handleT = normal.interpolatedWith(bright, pulse);
+            }
+        }
+        if(! firstOpenFlashActive)
+        {
+            if(toggleHot)
+                handleT = handleT.brighter(0.28f);
+            if(toggleDown)
+                handleT = handleT.darker(0.35f);
+        }
         if(! primed)
         {
             bg.set(bgT);
@@ -247,7 +278,7 @@ private:
             if(onHeightChanged)
                 onHeightChanged();
         }
-        if(moving)
+        if(moving || firstOpenFlashActive)
             repaint();
     }
     juce::String hintText { "-\n\nHover your mouse over any interface element for a description." };
@@ -260,6 +291,8 @@ private:
     int lastHeightPx = 22;
     bool toggleHot = false;
     bool toggleDown = false;
+    bool firstOpenFlashActive = false;
+    double firstOpenFlashStartMs = 0.0;
     const float expandedHeight = 132.0f;
     const float collapsedHeight = 22.0f;
     std::function<void()> onHeightChanged;

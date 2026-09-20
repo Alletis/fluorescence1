@@ -231,7 +231,10 @@ FluorescenceAudioProcessorEditor::FluorescenceAudioProcessorEditor(FluorescenceA
     hoverHintBox.setCollapsed(! (bool) proc.apvts.state.getProperty("uiHintOpen", false));
     hoverHintBox.onCollapsedChanged = [this]
     {
-        proc.apvts.state.setProperty("uiHintOpen", ! hoverHintBox.isCollapsed(), nullptr);
+        const bool hintOpen = ! hoverHintBox.isCollapsed();
+        proc.apvts.state.setProperty("uiHintOpen", hintOpen, nullptr);
+        if(hintOpen)
+            hoverHintBox.cancelFirstOpenFlash();
     };
     setWantsKeyboardFocus(true);
     addMouseListener(&mouseSpy, true);
@@ -254,6 +257,14 @@ FluorescenceAudioProcessorEditor::FluorescenceAudioProcessorEditor(FluorescenceA
     }
     startTimerHz(60);
     sizeRestoreDone = true;
+    juce::Component::SafePointer<FluorescenceAudioProcessorEditor> safe(this);
+    juce::Timer::callAfterDelay(100, [safe]
+    {
+        if(safe == nullptr || ! safe->proc.claimFirstEditorHintFlash())
+            return;
+        if(! (bool) safe->proc.apvts.state.getProperty("uiHintOpen", false))
+            safe->hoverHintBox.startFirstOpenFlash();
+    });
 }
 FluorescenceAudioProcessorEditor::~FluorescenceAudioProcessorEditor()
 {
@@ -756,6 +767,7 @@ void FluorescenceAudioProcessorEditor::resized()
         juce::Rectangle<int> hb(leftColumn.getX(), 0, leftColumn.getWidth() - pad, hintH);
         hb.setY(ab.getY() - 8 - hintH);
         hoverHintBox.setBounds(hb);
+        hoverHintBox.toFront(false);
     }
     const int H = right.getHeight();
     const int colW = right.getWidth() / 5;

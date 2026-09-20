@@ -31,6 +31,10 @@ public:
     void getStateInformation(juce::MemoryBlock& destData) override;
     void setStateInformation(const void* data, int sizeInBytes) override;
     juce::AudioProcessorValueTreeState apvts;
+    bool claimFirstEditorHintFlash() noexcept
+    {
+        return firstEditorHintFlashPending.exchange(false, std::memory_order_relaxed);
+    }
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
     void reconfigure(int newOrder, int newOverlap);
@@ -437,6 +441,7 @@ private:
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(FluorescenceAudioProcessor)
     void handleAsyncUpdate() override;
     std::atomic<int> pendingLatency { 0 };
+    std::atomic<bool> firstEditorHintFlashPending { true };
 public:
     using SpectrumBridgeType = SpectrumBridge<maxBins, maxBases>;
     SpectrumBridgeType& getSpectrumBridge() noexcept { return spectrumBridge; }
