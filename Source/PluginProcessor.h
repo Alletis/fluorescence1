@@ -49,7 +49,8 @@ private:
     float snapToTargetMidi(float baseHz, float targetMidi, float amount) const;
     void applyEnvelopeCompensation();
     void applyTimeAdditiveCompensation(int channel);
-    void buildEnvelopeCompensationCurve(float amount, bool applyToDestination);
+    void buildEnvelopeCompensationCurve(float amount, bool applyToDestination,
+                                        bool flattenAbsolute = false);
     float envelopeCompensationGainAt(float frequencyHz) const noexcept;
     float spectralEnvelopeCompAmount() const noexcept;
     float additiveEnvelopeCompAmount() const noexcept;

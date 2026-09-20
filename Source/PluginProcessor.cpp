@@ -2500,14 +2500,31 @@ void FluorescenceAudioProcessor::mapToDestination(int channel)
 }
 void FluorescenceAudioProcessor::applyEnvelopeCompensation()
 {
-    buildEnvelopeCompensationCurve(spectralEnvelopeCompAmount(), true);
+    const float amount = spectralEnvelopeCompAmount();
+    if(std::abs(amount) <= 1.0e-6f)
+    {
+        std::fill(envAppliedGain.begin(), envAppliedGain.begin() + numBins, 1.0f);
+        return;
+    }
+    const float linearCurveAmount = amount >= 0.0f
+        ? amount
+        : juce::jlimit(0.0f, 1.0f, -amount / 0.25f);
+    const float curveAmount = linearCurveAmount * linearCurveAmount;
+    buildEnvelopeCompensationCurve(curveAmount, amount >= 0.0f, true);
+    if(amount < 0.0f)
+        for(int bin = 0; bin < numBins; ++bin)
+        {
+            const float gain = 1.0f / juce::jmax(0.2f, envAppliedGain[(size_t) bin]);
+            envAppliedGain[(size_t) bin] = gain;
+            dstMag[(size_t) bin] *= gain;
+            dstFreqNum[(size_t) bin] *= gain;
+        }
 }
 float FluorescenceAudioProcessor::spectralEnvelopeCompAmount() const noexcept
 {
-    if(envCompParam == nullptr)
-        return 0.2f;
-    const float raw = juce::jlimit(-0.25f, 1.0f, envCompParam->load());
-    return juce::jlimit(0.0f, 1.0f, (raw + 0.25f) / 1.25f);
+    return envCompParam != nullptr
+        ? juce::jlimit(-0.25f, 1.0f, envCompParam->load())
+        : 0.0f;
 }
 float FluorescenceAudioProcessor::additiveEnvelopeCompAmount() const noexcept
 {
@@ -2516,7 +2533,8 @@ float FluorescenceAudioProcessor::additiveEnvelopeCompAmount() const noexcept
         : 0.0f;
 }
 void FluorescenceAudioProcessor::buildEnvelopeCompensationCurve(float amount,
-                                                              bool applyToDestination)
+                                                              bool applyToDestination,
+                                                              bool flattenAbsolute)
 {
     if(amount <= 0.0f)
     {
@@ -2557,6 +2575,8 @@ void FluorescenceAudioProcessor::buildEnvelopeCompensationCurve(float amount,
     const float alpha = 0.15f + 0.85f * amount;
     const float collisionStrength = 0.9f * amount;
     const float eps = 1.0e-8f;
+    const float broadbandRefAvg = envRefPrefix[(size_t) numBins]
+                                / (float) juce::jmax(1, numBins);
     const float sizeRef = (float) (1 << 12);
     const float sizeNorm = (fftSize > 0) ? (sizeRef / (float) fftSize) : 1.0f;
     for(int j = 1; j < numBins; ++j)
@@ -2567,7 +2587,8 @@ void FluorescenceAudioProcessor::buildEnvelopeCompensationCurve(float amount,
         const float lenInv = 1.0f / (float) (b - a + 1);
         const float refAvg = (envRefPrefix[(size_t) (b + 1)] - envRefPrefix[(size_t) a]) * lenInv;
         const float outAvg = (envOutPrefix[(size_t) (b + 1)] - envOutPrefix[(size_t) a]) * lenInv;
-        const float ratio = (refAvg + eps) / (outAvg + eps);
+        const float targetAvg = flattenAbsolute ? broadbandRefAvg : refAvg;
+        const float ratio = (targetAvg + eps) / (outAvg + eps);
         const float envGain = juce::jlimit(0.25f, 4.0f, fastPow(ratio, alpha));
         const float hits = 1.0f + (dstHitCount[(size_t) j] - 1.0f) * sizeNorm;
         const float collisionGain = (hits > 1.0f)
@@ -2599,10 +2620,11 @@ void FluorescenceAudioProcessor::applyTimeAdditiveCompensation(int channel)
     const float additiveAmount = additiveEnvelopeCompAmount();
     if(std::abs(additiveAmount) <= 1.0e-6f)
         return;
-    const float curveAmount = additiveAmount >= 0.0f
+    const float linearCurveAmount = additiveAmount >= 0.0f
         ? additiveAmount
         : juce::jlimit(0.0f, 1.0f, -additiveAmount / 0.25f);
-    buildEnvelopeCompensationCurve(curveAmount, false);
+    const float curveAmount = linearCurveAmount * linearCurveAmount;
+    buildEnvelopeCompensationCurve(curveAmount, false, true);
     for(auto& p : partials[(size_t) channel])
     {
         if(!p.matched || p.baseIdx < 0 || p.harmonic < 1 || p.freqOut <= 0.0f)
