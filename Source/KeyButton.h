@@ -88,7 +88,8 @@ public:
         draggingTitle = true;
         const auto off = e.getOffsetFromDragStart();
         const float along = (float) off.x - (float) off.y;
-        const int steps = (int) (along / pixelsPerStep);
+        const float stepDistance = pixelsPerStep * (e.mods.isCtrlDown() ? 3.0f : 1.0f);
+        const int steps = (int) (along / stepDistance);
         if(steps != appliedSteps)
         {
             setIndex(index + (steps - appliedSteps), true);

@@ -69,18 +69,37 @@ public:
     void mouseDown(const juce::MouseEvent& e) override
     {
         pressedRegion = Region::none;
+        appliedDragSteps = 0;
+        dragChanged = false;
+        draggingTitle = false;
         if(! isEnabled() || ! e.mods.isLeftButtonDown() || e.mods.isPopupMenu())
             return;
         pressedRegion = hitTestRegion(e.getEventRelativeTo(this).getPosition());
         repaint();
     }
-    void mouseDrag(const juce::MouseEvent&) override
+    void mouseDrag(const juce::MouseEvent& e) override
     {
+        if(! isEnabled() || pressedRegion != Region::title)
+            return;
+        draggingTitle = true;
+        const auto offset = e.getOffsetFromDragStart();
+        const float along = (float) offset.x - (float) offset.y;
+        const float stepDistance = dragPixelsPerStep * (e.mods.isCtrlDown() ? 3.0f : 1.0f);
+        const int steps = (int) (along / stepDistance);
+        const int delta = steps - appliedDragSteps;
+        if(delta == 0)
+            return;
+        const int direction = delta > 0 ? 1 : -1;
+        for(int i = 0; i < std::abs(delta); ++i)
+            if(onStep) onStep(direction);
+        appliedDragSteps = steps;
+        dragChanged = true;
     }
     void mouseUp(const juce::MouseEvent& e) override
     {
         const auto origin = pressedRegion;
         pressedRegion = Region::none;
+        draggingTitle = false;
         repaint();
         if(! isEnabled() || origin == Region::none)
             return;
@@ -94,15 +113,51 @@ public:
         {
             if(onStep) onStep(1);
         }
-        else if(origin == Region::title && ! e.mouseWasDraggedSinceMouseDown())
+        else if(origin == Region::title && ! dragChanged
+                 && ! e.mouseWasDraggedSinceMouseDown())
         {
             if(onClick) onClick();
+        }
+    }
+    void mouseWheelMove(const juce::MouseEvent& e,
+                        const juce::MouseWheelDetails& wheel) override
+    {
+        if(! isEnabled())
+            return;
+        const auto eventTimeMs = e.eventTime.toMilliseconds();
+        if(eventTimeMs == lastWheelEventTimeMs)
+            return;
+        lastWheelEventTimeMs = eventTimeMs;
+        const float primaryDelta = std::abs(wheel.deltaY) >= std::abs(wheel.deltaX)
+                                     ? wheel.deltaY : wheel.deltaX;
+        const int direction = primaryDelta > 0.0f ? 1 : primaryDelta < 0.0f ? -1 : 0;
+        if(direction == 0)
+            return;
+        if(! wheel.isSmooth)
+        {
+            smoothWheelAccumulator = 0.0f;
+            if(onStep) onStep(direction);
+            return;
+        }
+        smoothWheelAccumulator += primaryDelta * 5.0f;
+        while(smoothWheelAccumulator > 1.0f)
+        {
+            smoothWheelAccumulator -= 1.0f;
+            if(onStep) onStep(1);
+        }
+        while(smoothWheelAccumulator < -1.0f)
+        {
+            smoothWheelAccumulator += 1.0f;
+            if(onStep) onStep(-1);
         }
     }
     void enablementChanged() override
     {
         if(! isEnabled())
+        {
             pressedRegion = Region::none;
+            draggingTitle = false;
+        }
         repaint();
     }
 private:
@@ -157,8 +212,11 @@ private:
     }
     void timerCallback() override
     {
-        const auto hovered = (isEnabled() && isMouseOver(true))
-                                 ? hitTestRegion(getMouseXYRelative()) : Region::none;
+        const bool keepTitleHovered = isEnabled() && draggingTitle
+                                   && pressedRegion == Region::title;
+        const auto hovered = keepTitleHovered ? Region::title
+                           : (isEnabled() && isMouseOver(true))
+                               ? hitTestRegion(getMouseXYRelative()) : Region::none;
         const bool pressed = hovered != Region::none && hovered == pressedRegion
                              && isMouseButtonDown(true);
         bool moving = false;
@@ -209,7 +267,13 @@ private:
     }
     std::array<RegionColours, 3> colours;
     SmoothColour baseFill, baseOutline;
+    static constexpr float dragPixelsPerStep = 16.0f;
     Region pressedRegion = Region::none;
+    int appliedDragSteps = 0;
+    bool dragChanged = false;
+    bool draggingTitle = false;
+    juce::int64 lastWheelEventTimeMs = -1;
+    float smoothWheelAccumulator = 0.0f;
     bool primed = false;
     bool active = false;
     bool magentaAccent = false;

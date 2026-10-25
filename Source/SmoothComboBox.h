@@ -11,6 +11,7 @@ public:
     SmoothComboBox()
     {
         setColour(juce::ComboBox::textColourId, juce::Colours::transparentBlack);
+        setScrollWheelEnabled(false);
         startTimerHz(60);
     }
     ~SmoothComboBox() override { stopTimer(); }
@@ -68,6 +69,10 @@ public:
     void mouseDown(const juce::MouseEvent& e) override
     {
         pressedRegion = Region::none;
+        dragStartIndex = getSelectedItemIndex();
+        appliedDragSteps = 0;
+        dragChanged = false;
+        draggingTitle = false;
         if(! isEnabled() || isPopupActive() || ! e.mods.isLeftButtonDown()
             || e.mods.isPopupMenu())
             return;
@@ -76,13 +81,36 @@ public:
             pressedRegion = region;
         repaint();
     }
-    void mouseDrag(const juce::MouseEvent&) override
+    void mouseDrag(const juce::MouseEvent& e) override
     {
+        if(! isEnabled() || isPopupActive() || pressedRegion != Region::title)
+            return;
+        draggingTitle = true;
+        const auto offset = e.getOffsetFromDragStart();
+        const float along = (float) offset.x - (float) offset.y;
+        const float stepDistance = dragPixelsPerStep * (e.mods.isCtrlDown() ? 3.0f : 1.0f);
+        const int steps = (int) (along / stepDistance);
+        if(steps == appliedDragSteps)
+            return;
+        int target = dragStartIndex;
+        const int direction = steps >= 0 ? 1 : -1;
+        for(int i = 0; i < std::abs(steps); ++i)
+        {
+            const int next = steppedIndexFrom(target, direction);
+            if(next < 0)
+                break;
+            target = next;
+        }
+        if(target >= 0 && target != getSelectedItemIndex())
+            setSelectedItemIndex(target, juce::sendNotificationAsync);
+        appliedDragSteps = steps;
+        dragChanged = true;
     }
     void mouseUp(const juce::MouseEvent& e) override
     {
         const auto wasPressed = pressedRegion;
         pressedRegion = Region::none;
+        draggingTitle = false;
         repaint();
         if(! isEnabled() || isPopupActive() || wasPressed == Region::none)
             return;
@@ -91,11 +119,44 @@ public:
             return;
         if(wasPressed == Region::title)
         {
-            openPopupSoon();
+            if(! dragChanged && ! e.mouseWasDraggedSinceMouseDown())
+                openPopupSoon();
         }
         else
         {
             stepSelection(wasPressed == Region::previous ? -1 : 1);
+        }
+    }
+    void mouseWheelMove(const juce::MouseEvent& e,
+                        const juce::MouseWheelDetails& wheel) override
+    {
+        if(! isEnabled() || isPopupActive())
+            return;
+        const auto eventTimeMs = e.eventTime.toMilliseconds();
+        if(eventTimeMs == lastWheelEventTimeMs)
+            return;
+        lastWheelEventTimeMs = eventTimeMs;
+        const float primaryDelta = std::abs(wheel.deltaY) >= std::abs(wheel.deltaX)
+                                     ? wheel.deltaY : wheel.deltaX;
+        const int direction = primaryDelta > 0.0f ? 1 : primaryDelta < 0.0f ? -1 : 0;
+        if(direction == 0)
+            return;
+        if(! wheel.isSmooth)
+        {
+            smoothWheelAccumulator = 0.0f;
+            stepSelection(direction);
+            return;
+        }
+        smoothWheelAccumulator += primaryDelta * 5.0f;
+        while(smoothWheelAccumulator > 1.0f)
+        {
+            smoothWheelAccumulator -= 1.0f;
+            stepSelection(1);
+        }
+        while(smoothWheelAccumulator < -1.0f)
+        {
+            smoothWheelAccumulator += 1.0f;
+            stepSelection(-1);
         }
     }
     bool keyPressed(const juce::KeyPress& key) override
@@ -151,12 +212,11 @@ private:
             return Region::next;
         return Region::title;
     }
-    int steppedIndex(int direction) const
+    int steppedIndexFrom(int selected, int direction) const
     {
         const int count = getNumItems();
         if(! isEnabled() || isPopupActive() || count == 0 || direction == 0)
             return -1;
-        const int selected = getSelectedItemIndex();
         if(selected < 0)
         {
             for(int i = direction > 0 ? 0 : count - 1;
@@ -182,6 +242,10 @@ private:
                     return next;
         }
         return -1;
+    }
+    int steppedIndex(int direction) const
+    {
+        return steppedIndexFrom(getSelectedItemIndex(), direction);
     }
     bool isAvailable(Region region) const
     {
@@ -213,7 +277,10 @@ private:
     }
     void timerCallback() override
     {
-        const Region hovered = (isEnabled() && ! isPopupActive() && isMouseOver(true))
+        const bool keepTitleHovered = isEnabled() && draggingTitle
+                                   && pressedRegion == Region::title;
+        const Region hovered = keepTitleHovered ? Region::title
+                             : (isEnabled() && ! isPopupActive() && isMouseOver(true))
                                  ? hitTestRegion(getMouseXYRelative()) : Region::none;
         bool moving = false;
         constexpr float rate = 1.0f / 3.0f;
@@ -264,7 +331,14 @@ private:
     }
     std::array<RegionColours, 3> colours;
     SmoothColour baseFill, baseOutline;
+    static constexpr float dragPixelsPerStep = 48.0f;
     Region pressedRegion = Region::none;
+    int dragStartIndex = -1;
+    int appliedDragSteps = 0;
+    bool dragChanged = false;
+    bool draggingTitle = false;
+    juce::int64 lastWheelEventTimeMs = -1;
+    float smoothWheelAccumulator = 0.0f;
     bool wrapAround = false;
     bool primed = false;
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(SmoothComboBox)
