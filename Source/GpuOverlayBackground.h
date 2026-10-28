@@ -565,7 +565,7 @@ private:
         }
         vec3 sampleOverlay(vec2 position)
         {
-            vec2 coverPoint = (position - (plotRect.zw - 1.0) * 0.5 - overlayParams.yz)
+            vec2 coverPoint = (position - (plotSize - 1.0) * 0.5 - overlayParams.yz)
                             / overlayParams.x + (coverSize - 1.0) * 0.5;
             if(boundMode == 3 && (coverPoint.x < 0.0 || coverPoint.y < 0.0
                 || coverPoint.x > coverSize.x - 1.0 || coverPoint.y > coverSize.y - 1.0))

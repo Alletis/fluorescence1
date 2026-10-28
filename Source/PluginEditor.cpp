@@ -52,6 +52,7 @@ FluorescenceAudioProcessorEditor::FluorescenceAudioProcessorEditor(FluorescenceA
     logoFlyout.overlayPage.onSaveSkin = [this] { openSkinChooser(true); };
     overlayAssets.onChanged = [this]
     {
+        noteEditorActivity();
         content.repaint();
         spectrum.repaint();
         scSpectrum.repaint();
@@ -313,8 +314,13 @@ FluorescenceAudioProcessorEditor::FluorescenceAudioProcessorEditor(FluorescenceA
 #if ALLETIS_FLUORESCENCE_EXPERIMENTAL_OPENGL_UI
     experimentalOpenGLContext.setComponentPaintingEnabled(true);
     experimentalOpenGLContext.setContinuousRepainting(false);
+    experimentalOpenGLContext.setImageCacheSize(128u * 1024u * 1024u);
     experimentalOpenGLContext.attachTo(*this);
+    openGLContextAttached = true;
+    openGLIdleStartedMs = juce::Time::getMillisecondCounterHiRes();
 #endif
+    for(auto* parameter : proc.getParameters())
+        parameter->addListener(this);
     juce::Component::SafePointer<FluorescenceAudioProcessorEditor> safe(this);
     juce::Timer::callAfterDelay(100, [safe]
     {
@@ -326,8 +332,11 @@ FluorescenceAudioProcessorEditor::FluorescenceAudioProcessorEditor(FluorescenceA
 }
 FluorescenceAudioProcessorEditor::~FluorescenceAudioProcessorEditor()
 {
+    for(auto* parameter : proc.getParameters())
+        parameter->removeListener(this);
 #if ALLETIS_FLUORESCENCE_EXPERIMENTAL_OPENGL_UI
     experimentalOpenGLContext.detach();
+    openGLContextAttached = false;
 #endif
     stopTimer();
     overlayAssets.onChanged = nullptr;
@@ -385,6 +394,42 @@ void FluorescenceAudioProcessorEditor::timerCallback()
         modePhase = modeTarget;
         applyModeAlphas();
     }
+}
+void FluorescenceAudioProcessorEditor::noteEditorActivity() noexcept
+{
+#if ALLETIS_FLUORESCENCE_EXPERIMENTAL_OPENGL_UI
+    editorActivitySerial.fetch_add(1, std::memory_order_relaxed);
+#endif
+}
+void FluorescenceAudioProcessorEditor::parameterValueChanged(int, float)
+{
+    noteEditorActivity();
+}
+void FluorescenceAudioProcessorEditor::parameterGestureChanged(int, bool)
+{
+    noteEditorActivity();
+}
+void FluorescenceAudioProcessorEditor::refreshOpenGLContextIfIdle()
+{
+#if ALLETIS_FLUORESCENCE_EXPERIMENTAL_OPENGL_UI
+    const double now = juce::Time::getMillisecondCounterHiRes();
+    const auto activity = editorActivitySerial.load(std::memory_order_relaxed);
+    if(activity != observedEditorActivitySerial)
+    {
+        observedEditorActivitySerial = activity;
+        openGLIdleStartedMs = now;
+        return;
+    }
+    if(! openGLContextAttached || ! isShowing()
+       || now - openGLIdleStartedMs < 30000.0)
+        return;
+    openGLContextAttached = false;
+    experimentalOpenGLContext.detach();
+    experimentalOpenGLContext.attachTo(*this);
+    openGLContextAttached = true;
+    openGLIdleStartedMs = now;
+    repaint();
+#endif
 }
 void FluorescenceAudioProcessorEditor::showTitleContextMenu(juce::Point<int> screenPosition)
 {
@@ -998,6 +1043,7 @@ juce::String FluorescenceAudioProcessorEditor::findHoverHintTextForComponent(juc
 }
 void FluorescenceAudioProcessorEditor::handleGlobalMouseDown(const juce::MouseEvent& e)
 {
+    noteEditorActivity();
     if(logoFlyout.isBlockingMouse())
         return;
     bool onSlider = false, insideFlyout = false, onButton = false, inLogoFlyout = false;
@@ -1225,15 +1271,18 @@ void FluorescenceAudioProcessorEditor::applySoftwareRenderer()
 }
 void FluorescenceAudioProcessorEditor::parentHierarchyChanged()
 {
+    noteEditorActivity();
     applySoftwareRenderer();
 }
 void FluorescenceAudioProcessorEditor::visibilityChanged()
 {
+    noteEditorActivity();
     if(isShowing())
         applySoftwareRenderer();
 }
 void FluorescenceAudioProcessorEditor::resized()
 {
+    noteEditorActivity();
     const float sx = (float) getWidth() / (float) baseW;
     const float sy = (float) getHeight() / (float) baseH;
     uiZoom = juce::jlimit(minZoom, maxZoom, sx);

@@ -376,7 +376,8 @@ public:
 private:
 };
 class FluorescenceAudioProcessorEditor : public juce::AudioProcessorEditor,
-                                       private juce::Timer
+                                       private juce::Timer,
+                                       private juce::AudioProcessorParameter::Listener
 {
 public:
     explicit FluorescenceAudioProcessorEditor(FluorescenceAudioProcessor&);
@@ -406,9 +407,17 @@ private:
     void rebuildLogo();
     void handleGlobalMouseDown(const juce::MouseEvent&);
     void handleGlobalMouseMove(const juce::MouseEvent&);
+    void noteEditorActivity() noexcept;
+    void refreshOpenGLContextIfIdle();
+    void parameterValueChanged(int, float) override;
+    void parameterGestureChanged(int, bool) override;
     void applySoftwareRenderer();
 #if ALLETIS_FLUORESCENCE_EXPERIMENTAL_OPENGL_UI
     juce::OpenGLContext experimentalOpenGLContext;
+    std::atomic<juce::uint64> editorActivitySerial { 1 };
+    juce::uint64 observedEditorActivitySerial = 0;
+    double openGLIdleStartedMs = 0.0;
+    bool openGLContextAttached = false;
 #endif
     juce::Label* findReadoutLabelForKnob(ValueKnob* knob);
     juce::String findHoverHintTextForComponent(juce::Component* eventComponent) const;

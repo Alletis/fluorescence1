@@ -515,7 +515,7 @@ private:
     static constexpr float minDisableVisualGapPx = 2.0f;
     static constexpr float disableHandleCornerRadius = 4.0f;
     static constexpr float disableHandleHeightRatio = 0.66f;
-    std::vector<float> peak, bright, src, glowWidth;
+    std::vector<float> peak, bright, src, glowWidth, baseStripOpacity;
     std::vector<juce::uint8> maxRed, maxGreen, maxBlue;
     void resized() override
     {
@@ -529,6 +529,7 @@ private:
             bright.assign((size_t) w, 0.0f);
             src.assign((size_t) w, 0.0f);
             glowWidth.assign((size_t) w, 1.0f);
+            baseStripOpacity.assign((size_t) w, 0.0f);
             maxRed.assign((size_t) w, 0);
             maxGreen.assign((size_t) w, 0);
             maxBlue.assign((size_t) w, 0);
@@ -634,7 +635,10 @@ private:
         const float visualScale = 1.0f - bypassVisualAmt;
         if(visualScale < 0.02f)
             return;
-        std::vector<float> opacity((size_t) width, 0.0f);
+        if((int) baseStripOpacity.size() != width)
+            baseStripOpacity.assign((size_t) width, 0.0f);
+        else
+            std::fill(baseStripOpacity.begin(), baseStripOpacity.end(), 0.0f);
         const int channels = juce::jlimit(0, Snapshot::maxChannels, snapshot.numChannels);
         for(int channel = 0; channel < channels; ++channel)
             for(int index = 0; index < snapshot.numBases[(size_t) channel]; ++index)
@@ -668,8 +672,8 @@ private:
                             0.0f, 1.0f, halfWidth + 0.5f - distance);
                         profile = juce::jmax(profile, 0.12f * (float) layer * coverage);
                     }
-                    opacity[(size_t) pixel] = juce::jmax(
-                        opacity[(size_t) pixel], stripOpacity * profile);
+                    baseStripOpacity[(size_t) pixel] = juce::jmax(
+                        baseStripOpacity[(size_t) pixel], stripOpacity * profile);
                 }
             }
         const auto colour = baseLineColour();
@@ -677,7 +681,7 @@ private:
         const float firstPixelX = plot.getX();
         for(int x = 0; x < width; ++x)
         {
-            const float alpha = opacity[(size_t) x];
+            const float alpha = baseStripOpacity[(size_t) x];
             if(alpha <= 0.0f)
                 continue;
             g.setColour(colour.withAlpha(alpha));
@@ -765,13 +769,14 @@ private:
         if(! overlayCover.isValid()) return;
         const float brightness = juce::jlimit(
             0.0f, 1.0f, overlay.settings.brightness * overlay.loadMultiplier);
-        juce::Image merged(juce::Image::RGB, w, h, false);
+        if(! overlayMergedImage.isValid()
+           || overlayMergedImage.getWidth() != w || overlayMergedImage.getHeight() != h)
+            overlayMergedImage = juce::Image(juce::Image::RGB, w, h, false);
         juce::Image::BitmapData image(overlayCover, juce::Image::BitmapData::readOnly);
-        std::unique_ptr<juce::Image::BitmapData> previousImage;
+        std::optional<juce::Image::BitmapData> previousImage;
         if(previousOverlayCover.isValid())
-            previousImage = std::make_unique<juce::Image::BitmapData>(
-                previousOverlayCover, juce::Image::BitmapData::readOnly);
-        juce::Image::BitmapData dest(merged, juce::Image::BitmapData::writeOnly);
+            previousImage.emplace(previousOverlayCover, juce::Image::BitmapData::readOnly);
+        juce::Image::BitmapData dest(overlayMergedImage, juce::Image::BitmapData::writeOnly);
         juce::Image::BitmapData heat(heatImage, juce::Image::BitmapData::readOnly);
         for(int x = 0; x < w; ++x)
         {
@@ -781,7 +786,7 @@ private:
             for(int y = 0; y < h; ++y)
             {
                 auto pixel = image.getPixelColour(x, y);
-                if(previousImage != nullptr && overlay.blurTransition < 0.9999f)
+                if(previousImage.has_value() && overlay.blurTransition < 0.9999f)
                     pixel = previousImage->getPixelColour(x, y).interpolatedWith(
                         pixel, overlay.blurTransition);
                 const float f = brightness * pixel.getFloatAlpha();
@@ -796,7 +801,8 @@ private:
         juce::Path clip;
         clip.addRoundedRectangle(plot, spectrumCornerRadius);
         g.reduceClipRegion(clip);
-        g.drawImageAt(merged, juce::roundToInt(plot.getX()), juce::roundToInt(plot.getY()));
+        g.drawImageAt(overlayMergedImage,
+                  juce::roundToInt(plot.getX()), juce::roundToInt(plot.getY()));
     }
     void rebuildImage()
     {
@@ -1440,7 +1446,7 @@ private:
     juce::Image transparentHeatImage;
     FluorescenceOverlayAssets* overlayAssets = nullptr;
     SpectrumDisplay* overlayDisplaySource = nullptr;
-    juce::Image overlayCover, overlayCoverSource;
+    juce::Image overlayCover, overlayCoverSource, overlayMergedImage;
     juce::Image previousOverlayCover, previousOverlayCoverSource;
     bool overlayTransformCacheValid = false;
     float overlayCachedResize = -1.0f;

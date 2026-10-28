@@ -42,6 +42,7 @@ public:
     GLuint texture = 0;
     GLuint intermediateTexture = 0;
     int width = 0, height = 0;
+    int intermediateWidth = 0, intermediateHeight = 0;
 };
 #endif
 class MenuDotsButton : public juce::Button,
@@ -450,8 +451,16 @@ public:
                                       juce::gl::GL_CLAMP_TO_EDGE);
             juce::gl::glTexParameteri(juce::gl::GL_TEXTURE_2D, juce::gl::GL_TEXTURE_WRAP_T,
                                       juce::gl::GL_CLAMP_TO_EDGE);
-            juce::gl::glCopyTexImage2D(juce::gl::GL_TEXTURE_2D, 0, juce::gl::GL_RGBA,
-                                       viewport[0], viewport[1], width, height, 0);
+            if(cache->intermediateWidth != width || cache->intermediateHeight != height)
+            {
+                juce::gl::glTexImage2D(juce::gl::GL_TEXTURE_2D, 0, juce::gl::GL_RGBA,
+                                       width, height, 0, juce::gl::GL_RGBA,
+                                       juce::gl::GL_UNSIGNED_BYTE, nullptr);
+                cache->intermediateWidth = width;
+                cache->intermediateHeight = height;
+            }
+            juce::gl::glCopyTexSubImage2D(juce::gl::GL_TEXTURE_2D, 0, 0, 0,
+                                          viewport[0], viewport[1], width, height);
             context->extensions.glActiveTexture(juce::gl::GL_TEXTURE4);
             juce::gl::glBindTexture(juce::gl::GL_TEXTURE_2D, cache->texture);
             juce::OpenGLShaderProgram::Uniform horizontalCopy(program, "horizontalCopy");
