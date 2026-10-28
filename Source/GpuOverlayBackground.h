@@ -326,8 +326,7 @@ public:
     bool paint(juce::Graphics& g, juce::Rectangle<float> plot,
                juce::Rectangle<float> targetPlot, juce::Point<float> targetSize,
                const FluorescenceOverlayAssets::Snapshot& source,
-               const juce::Image& heatStrip, const std::vector<float>& baseBoost,
-               juce::Colour baseColour)
+               const juce::Image& heatStrip)
     {
         auto* context = juce::OpenGLContext::getCurrentContext();
         const auto plotBounds = plot.toNearestInt();
@@ -351,21 +350,7 @@ public:
         }
         if(cache->raw.getTextureID() == 0)
             return false;
-        juce::Image boostImage(juce::Image::RGB, plotW, 1, true);
-        {
-            juce::Image::BitmapData pixels(boostImage, juce::Image::BitmapData::writeOnly);
-            for(int x = 0; x < plotW; ++x)
-            {
-                const float amount = x < (int)baseBoost.size()
-                                   ? juce::jlimit(0.0f, 1.0f, baseBoost[(size_t)x]) : 0.0f;
-                pixels.setPixelColour(x, 0, juce::Colour::fromFloatRGBA(
-                    baseColour.getFloatRed() * amount,
-                    baseColour.getFloatGreen() * amount,
-                    baseColour.getFloatBlue() * amount, 1.0f));
-            }
-        }
         cache->heat.loadImage(heatStrip);
-        cache->boost.loadImage(boostImage);
         const float coverScale = juce::jmax((float)plotW / (float)raw.getWidth(),
                                              (float)plotH / (float)raw.getHeight());
         const int coverW = juce::jmax(plotW, juce::roundToInt((float)raw.getWidth() * coverScale));
@@ -398,10 +383,8 @@ public:
             juce::gl::glGetIntegerv(juce::gl::GL_ACTIVE_TEXTURE, &oldUnit);
             bindTexture(*activeContext, 3, overlayTexture);
             bindTexture(*activeContext, 4, resources.heat.getTextureID());
-            bindTexture(*activeContext, 5, resources.boost.getTextureID());
             uniform(program, "overlayTexture", 3);
             uniform(program, "heatTexture", 4);
-            uniform(program, "boostTexture", 5);
                 uniform(program, "plotSize", (float)plotW, (float)plotH);
                 uniform(program, "targetPlot", targetPlot);
                 uniform(program, "targetLogicalSize", targetSize.x, targetSize.y);
@@ -424,7 +407,7 @@ public:
 private:
     struct Resources final : juce::ReferenceCountedObject
     {
-        juce::OpenGLTexture raw, heat, boost;
+        juce::OpenGLTexture raw, heat;
         juce::OpenGLFrameBuffer horizontal, vertical;
         juce::Image rawImage;
         float blurSigma = -1.0f;
@@ -565,7 +548,7 @@ private:
         }
     )GLSL";
     static constexpr const char* compositeCode = R"GLSL(
-        uniform sampler2D overlayTexture, heatTexture, boostTexture;
+        uniform sampler2D overlayTexture, heatTexture;
         uniform vec4 targetPlot, overlayParams;
         uniform vec2 plotSize, coverSize, targetLogicalSize, targetPhysicalSize;
         uniform int boundMode;
@@ -600,9 +583,8 @@ private:
             float x = clamp((local.x + 0.5) / plotSize.x, 0.0, 1.0);
             vec3 overlay = sampleOverlay(local) * overlayParams.w;
             float heat = texture2D(heatTexture, vec2(x, 0.5)).r * 0.54;
-            vec3 foundation = texture2D(boostTexture, vec2(x, 0.5)).rgb;
             vec3 rgb = min(vec3(1.0), vec3(10.0, 10.0, 12.0) / 255.0
-                                      + overlay + vec3(heat) + foundation);
+                                      + overlay + vec3(heat));
             gl_FragColor = vec4(rgb * pixelAlpha, pixelAlpha);
         }
     )GLSL";

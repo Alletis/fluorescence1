@@ -110,9 +110,9 @@ public:
         {
             juce::Graphics::ScopedSaveState ss(g);
             g.reduceClipRegion(plotClip);
-            g.drawImage(useOverlay ? transparentHeatImage : heatImage,
-                         juce::Rectangle<float> (plotX, plotY, W, H),
-                         juce::RectanglePlacement::stretchToFit);
+            if(! useOverlay)
+                g.drawImage(heatImage, juce::Rectangle<float> (plotX, plotY, W, H),
+                             juce::RectanglePlacement::stretchToFit);
             if(disableUiEnabled)
             {
                 const float shadeAlpha = 1.0f - bypassVisualAmt;
@@ -154,25 +154,7 @@ public:
                 drawDashedLine(g, plot, plotX + freqToX(dispDisableFreqHiHz(), W),
                                 disableHandleStrokeColour(false, disableHiHighlightAmt, disableHiPressAmt).withAlpha(0.65f));
             }
-            const juce::Colour baseCol = baseLineColour();
-            const float stripAlphaScale = 1.0f - bypassVisualAmt;
-            const int baseChannelCount = juce::jlimit(0, Snapshot::maxChannels, snapshot.numChannels);
-            for(int channel = 0; channel < baseChannelCount; ++channel)
-                for(int i = 0; i < snapshot.numBases[(size_t) channel]; ++i)
-                {
-                    const float f = snapshot.baseHz[(size_t) channel][(size_t) i];
-                    const float conf = snapshot.baseConf[(size_t) channel][(size_t) i];
-                    if(f <= 0.0f || conf < 0.05f || stripAlphaScale < 0.02f) continue;
-                    const float a = juce::jlimit(0.0f, 1.0f, conf * stripAlphaScale);
-                    const float x = plotX + freqToX(f, W);
-                    for(int gx = 3; gx >= 1; --gx)
-                    {
-                        g.setColour(baseCol.withAlpha(0.12f * (float) gx * a));
-                        g.fillRect(x - (float) gx, plotY, 2.0f * (float) gx, H);
-                    }
-                    g.setColour(baseCol.withAlpha(a));
-                    g.fillRect(x - 1.0f, plotY, 2.0f, H);
-                }
+            paintBaseStrips(g, plot);
             const float rad = 9.0f * 0.67f;
             const float stroke = rad * 0.33f;
             const float haloPad = rad * 0.45f;
@@ -533,7 +515,7 @@ private:
     static constexpr float minDisableVisualGapPx = 2.0f;
     static constexpr float disableHandleCornerRadius = 4.0f;
     static constexpr float disableHandleHeightRatio = 0.66f;
-    std::vector<float> peak, bright, src;
+    std::vector<float> peak, bright, src, glowWidth;
     std::vector<juce::uint8> maxRed, maxGreen, maxBlue;
     void resized() override
     {
@@ -546,17 +528,21 @@ private:
             peak.assign((size_t) w, 0.0f);
             bright.assign((size_t) w, 0.0f);
             src.assign((size_t) w, 0.0f);
+            glowWidth.assign((size_t) w, 1.0f);
             maxRed.assign((size_t) w, 0);
             maxGreen.assign((size_t) w, 0);
             maxBlue.assign((size_t) w, 0);
             rebuildImage();
         }
     }
-    static float splatProfile(float dist) noexcept
+    static float splatProfile(float dist, float widthScale) noexcept
     {
-        if(dist <= splatFlatPx) return 1.0f;
-        if(dist >= splatHalfPx) return 0.0f;
-        const float t = (dist - splatFlatPx) / (splatHalfPx - splatFlatPx);
+        const float halfWidth = splatHalfPx * widthScale;
+        const float flatWidth = splatFlatPx * widthScale;
+        if(dist <= flatWidth) return 1.0f;
+        if(dist >= halfWidth)
+            return juce::jlimit(0.0f, 1.0f, halfWidth + 0.5f - dist);
+        const float t = (dist - flatWidth) / (halfWidth - flatWidth);
         return 1.0f - t * t * (3.0f - 2.0f * t);
     }
     void timerCallback() override
@@ -642,6 +628,63 @@ private:
         disableOverlayAlpha = juce::jlimit(0.0f, 1.0f, disableOverlayAlpha);
         repaint();
     }
+    void paintBaseStrips(juce::Graphics& g, juce::Rectangle<float> plot)
+    {
+        const int width = juce::jmax(1, juce::roundToInt(plot.getWidth()));
+        const float visualScale = 1.0f - bypassVisualAmt;
+        if(visualScale < 0.02f)
+            return;
+        std::vector<float> opacity((size_t) width, 0.0f);
+        const int channels = juce::jlimit(0, Snapshot::maxChannels, snapshot.numChannels);
+        for(int channel = 0; channel < channels; ++channel)
+            for(int index = 0; index < snapshot.numBases[(size_t) channel]; ++index)
+            {
+                const float frequency = snapshot.baseHz[(size_t) channel][(size_t) index];
+                if(frequency <= 0.0f)
+                    continue;
+                const float confidence = snapshot.baseConf[(size_t) channel][(size_t) index];
+                const float stripOpacity = juce::jmap(std::powf(
+                    juce::jlimit(0.0f, 1.0f, confidence), 0.6f), 0.1f, 1.0f)
+                    * visualScale;
+                const int center = juce::jlimit(0, width - 1,
+                    juce::roundToInt(freqToX(frequency, (float) width)));
+                const float stripWidth = juce::jmin(
+                    2.0f, binVisualWidth(frequency, (float) width));
+                const float glowRadius = 3.0f * stripWidth / 2.0f;
+                const int reach = (int) std::ceil(glowRadius + 0.5f);
+                for(int dx = -reach; dx <= reach; ++dx)
+                {
+                    const int pixel = center + dx;
+                    if(pixel < 0 || pixel >= width)
+                        continue;
+                    const float distance = (float) std::abs(dx);
+                    const float coreCoverage = juce::jlimit(
+                        0.0f, 1.0f, stripWidth * 0.5f + 0.5f - distance);
+                    float profile = coreCoverage;
+                    for(int layer = 1; layer <= 3; ++layer)
+                    {
+                        const float halfWidth = glowRadius * (float) layer / 3.0f;
+                        const float coverage = juce::jlimit(
+                            0.0f, 1.0f, halfWidth + 0.5f - distance);
+                        profile = juce::jmax(profile, 0.12f * (float) layer * coverage);
+                    }
+                    opacity[(size_t) pixel] = juce::jmax(
+                        opacity[(size_t) pixel], stripOpacity * profile);
+                }
+            }
+        const auto colour = baseLineColour();
+        const float pixelWidth = plot.getWidth() / (float) width;
+        const float firstPixelX = plot.getX();
+        for(int x = 0; x < width; ++x)
+        {
+            const float alpha = opacity[(size_t) x];
+            if(alpha <= 0.0f)
+                continue;
+            g.setColour(colour.withAlpha(alpha));
+            g.fillRect(firstPixelX + (float) x * pixelWidth, plot.getY(),
+                       pixelWidth, plot.getHeight());
+        }
+    }
     void paintSpectrumUnion(juce::Graphics& g, juce::Rectangle<float> plot,
                             const FluorescenceOverlayAssets::Snapshot& overlay,
                             bool sourceIsDisplayedImage)
@@ -649,23 +692,6 @@ private:
         const int w = juce::jmax(1, juce::roundToInt(plot.getWidth()));
         const int h = juce::jmax(1, juce::roundToInt(plot.getHeight()));
         const auto boundMode = overlay.settings.boundMode;
-        std::vector<float> baseBoost((size_t) w, 0.0f);
-        const int baseChannels = juce::jlimit(0, Snapshot::maxChannels, snapshot.numChannels);
-        const float visualScale = 1.0f - bypassVisualAmt;
-        for(int ch = 0; ch < baseChannels; ++ch)
-            for(int i = 0; i < snapshot.numBases[(size_t) ch]; ++i)
-            {
-                const float hz = snapshot.baseHz[(size_t) ch][(size_t) i];
-                const float confidence = snapshot.baseConf[(size_t) ch][(size_t) i];
-                if(hz <= 0.0f || confidence < 0.05f) continue;
-                const int center = juce::roundToInt(freqToX(hz, (float) w));
-                for(int dx = -3; dx <= 3; ++dx)
-                    if(center + dx >= 0 && center + dx < w)
-                        baseBoost[(size_t)(center + dx)] = juce::jmax(
-                            baseBoost[(size_t)(center + dx)],
-                            confidence * visualScale * (dx == 0 ? 0.8f : 0.25f));
-            }
-        const auto lineColour = baseLineColour();
        #if ALLETIS_FLUORESCENCE_EXPERIMENTAL_OPENGL_UI
         if(!sourceIsDisplayedImage)
         {
@@ -683,7 +709,7 @@ private:
                 (float)targetBounds.getWidth(), (float)targetBounds.getHeight()
             };
             if(gpuOverlay.paint(g, plot, targetPlot, targetSize,
-                                overlay, heatImage, baseBoost, lineColour))
+                                overlay, heatImage))
                 return;
         }
        #endif
@@ -760,11 +786,10 @@ private:
                         pixel, overlay.blurTransition);
                 const float f = brightness * pixel.getFloatAlpha();
                 const float frequencyLight = heatStrength * 0.54f;
-                const float foundation = baseBoost[(size_t)x];
                 dest.setPixelColour(x, y, juce::Colour(
-                    (juce::uint8) juce::jmin(255, 10 + juce::roundToInt(pixel.getRed() * f + 255.0f * frequencyLight + lineColour.getRed() * foundation)),
-                    (juce::uint8) juce::jmin(255, 10 + juce::roundToInt(pixel.getGreen() * f + 255.0f * frequencyLight + lineColour.getGreen() * foundation)),
-                    (juce::uint8) juce::jmin(255, 12 + juce::roundToInt(pixel.getBlue() * f + 255.0f * frequencyLight + lineColour.getBlue() * foundation))));
+                    (juce::uint8) juce::jmin(255, 10 + juce::roundToInt(pixel.getRed() * f + 255.0f * frequencyLight)),
+                    (juce::uint8) juce::jmin(255, 10 + juce::roundToInt(pixel.getGreen() * f + 255.0f * frequencyLight)),
+                    (juce::uint8) juce::jmin(255, 12 + juce::roundToInt(pixel.getBlue() * f + 255.0f * frequencyLight))));
             }
         }
         juce::Graphics::ScopedSaveState saved(g);
@@ -782,9 +807,6 @@ private:
         constexpr float sigma = 4.0f;
         constexpr float glowExp = 3.0f;
         constexpr float glowGain = 0.6f;
-        std::array<float, (size_t) (2 * R + 1)> kernel {};
-        for(int k = -R; k <= R; ++k)
-            kernel[(size_t) (k + R)] = std::exp(-(float) (k * k) / (2.0f * sigma * sigma));
         std::fill(maxRed.begin(), maxRed.end(), 0);
         std::fill(maxGreen.begin(), maxGreen.end(), 0);
         std::fill(maxBlue.begin(), maxBlue.end(), 0);
@@ -792,6 +814,7 @@ private:
         for(int channel = 0; channel < channelCount; ++channel)
         {
             std::fill(peak.begin(), peak.end(), 0.0f);
+            std::fill(glowWidth.begin(), glowWidth.end(), 1.0f);
             for(int j = 0; j < snapshot.numBins; ++j)
             {
                 const float f = snapshot.freq[(size_t) channel][(size_t) j];
@@ -800,14 +823,21 @@ private:
                 if(pos < 0.0f || pos > 1.0f) continue;
                 const float m = snapshot.mag[(size_t) channel][(size_t) j];
                 const float fx = pos * (float) (W - 1);
+                const float widthScale = juce::jlimit(
+                    0.0f, 1.0f, binVisualWidth(f, (float) W) / (2.0f * splatHalfPx));
                 const int c = (int) std::floor(fx);
                 for(int d = -reach; d <= reach + 1; ++d)
                 {
                     const int px = c + d;
                     if(px < 0 || px >= W) continue;
-                    const float wgt = splatProfile(std::abs((float) px - fx));
-                    if(wgt > 0.0f)
-                        peak[(size_t) px] = std::max(peak[(size_t) px], m * wgt);
+                    const float wgt = splatProfile(
+                        std::abs((float) px - fx), widthScale);
+                    const float weightedMagnitude = m * wgt;
+                    if(weightedMagnitude > peak[(size_t) px])
+                    {
+                        peak[(size_t) px] = weightedMagnitude;
+                        glowWidth[(size_t) px] = widthScale;
+                    }
                 }
             }
             for(int x = 0; x < W; ++x)
@@ -825,7 +855,17 @@ private:
                 {
                     const int sx = x + k;
                     if(sx >= 0 && sx < W)
-                        glow += kernel[(size_t) (k + R)] * src[(size_t) sx];
+                    {
+                        const float widthScale = glowWidth[(size_t) sx];
+                        const float scaledRadius = (float) R * widthScale;
+                        if((float) std::abs(k) <= scaledRadius)
+                        {
+                            const float scaledSigma = juce::jmax(0.001f, sigma * widthScale);
+                            const float weight = std::exp(
+                                -(float) (k * k) / (2.0f * scaledSigma * scaledSigma));
+                            glow += weight * src[(size_t) sx];
+                        }
+                    }
                 }
                 const float g = juce::jlimit(0.0f, 1.0f, glowGain * glow);
                 const float b = bright[(size_t) x];
@@ -1227,6 +1267,15 @@ private:
         return std::log(f / fMin) / std::log(fMax / fMin);
     }
     float freqToX(float f, float W) const { return juce::jlimit(0.0f, 1.0f, freqPos(f)) * W; }
+    float binVisualWidth(float frequency, float width) const
+    {
+        if(snapshot.binWidth <= 0.0f || frequency <= 0.0f || fMax <= fMin)
+            return 2.0f;
+        const float halfBin = snapshot.binWidth * 0.5f;
+        const float low = juce::jmax(1.0e-6f, frequency - halfBin);
+        const float high = frequency + halfBin;
+        return width * std::log(high / low) / std::log(fMax / fMin);
+    }
     float xToFreq(float x, float W) const
     {
         const float pos = juce::jlimit(0.0f, 1.0f, x / W);
