@@ -36,6 +36,9 @@ public:
         peakWork.assign((size_t) maxPeaks, 0.0f);
         peakBin.assign((size_t) maxPeaks, 0);
         harmonicMap.assign((size_t) maxPeaks * (size_t) maxPeaks, 0);
+        harmonicRelevantPeaks.assign((size_t) maxPeaks * (size_t) maxPeaks, 0);
+        harmonicRelevantCounts.assign((size_t) maxPeaks, 0);
+        salienceScratch.prepare(maxPeaks);
         rawPeaks.reserve((size_t) MaxBins);
         baseFreq.assign((size_t) MaxBases, 0.0f);
         baseSal.assign((size_t) MaxBases, 0.0f);
@@ -192,7 +195,9 @@ private:
                 frequency = frequencies[(size_t) sourceBin] * p.pitchRatio;
                 return std::isfinite(frequency) && frequency >= 20.0f;
             },
-            peakBin, peakFreq, peakAmp, peakWork, harmonicMap, rawPeaks, baseFreq, baseSal);
+            peakBin, peakFreq, peakAmp, peakWork, harmonicMap,
+            harmonicRelevantPeaks, harmonicRelevantCounts, salienceScratch,
+            rawPeaks, baseFreq, baseSal);
         numPeaks = result.numPeaks;
         numBases = result.numBases;
         const float tonal = juce::jlimit(0.0f, 1.0f,
@@ -413,6 +418,9 @@ private:
     std::vector<int> peakBin;
     std::vector<float> peakFreq, peakAmp, peakWork;
     std::vector<unsigned char> harmonicMap;
+    std::vector<unsigned short> harmonicRelevantPeaks;
+    std::vector<int> harmonicRelevantCounts;
+    base_detection::SalienceScratch salienceScratch;
     std::vector<base_detection::RawPeak> rawPeaks;
     std::vector<float> baseFreq, baseSal, baseConf;
     std::array<std::array<float, MaxBases>, maxChannels> channelBaseFreq {};

@@ -63,6 +63,9 @@ private:
     bool resolvePeakObservation(int channel, int sourceBin, int& analysisBin, float& peakHz) const;
     void rebuildHarmonicPeakList(int channel, float frameMaxMag);
     std::vector<unsigned char> harmonicMap;
+    std::vector<unsigned short> harmonicRelevantPeaks;
+    std::vector<int> harmonicRelevantCounts;
+    base_detection::SalienceScratch salienceScratch;
     float snapBaseToScale(float baseHz, float amount, float fineCents) const;
     float nearestTargetMidi(float baseHz) const;
     float snapToTargetMidi(float baseHz, float targetMidi, float amount) const;
@@ -318,6 +321,7 @@ private:
     std::array<int, maxChannels> nextPartialId {};
     std::vector<int> peakMatchedPartial;
     std::vector<MatchCand> matchCands;
+    std::vector<int> matchPeakOrder;
     int64_t frameCounter = 0;
     static constexpr int kernelHalf = 3;
     static constexpr int kernelOS = 512;
