@@ -11,6 +11,8 @@
 #include "Preferences.h"
 #include "OverlayRendering.h"
 #include <array>
+#include <limits>
+#include <vector>
 FluorescenceAudioProcessorEditor::FluorescenceAudioProcessorEditor(FluorescenceAudioProcessor& p)
     : AudioProcessorEditor(p),
       proc(p),
@@ -52,6 +54,9 @@ FluorescenceAudioProcessorEditor::FluorescenceAudioProcessorEditor(FluorescenceA
     logoFlyout.overlayPage.onSaveSkin = [this] { openSkinChooser(true); };
     overlayAssets.onChanged = [this]
     {
+#if ALLETIS_FLUORESCENCE_EXPERIMENTAL_OPENGL_UI
+        updateOpenGLImageCacheSize();
+#endif
         noteEditorActivity();
         content.repaint();
         spectrum.repaint();
@@ -314,7 +319,7 @@ FluorescenceAudioProcessorEditor::FluorescenceAudioProcessorEditor(FluorescenceA
 #if ALLETIS_FLUORESCENCE_EXPERIMENTAL_OPENGL_UI
     experimentalOpenGLContext.setComponentPaintingEnabled(true);
     experimentalOpenGLContext.setContinuousRepainting(false);
-    experimentalOpenGLContext.setImageCacheSize(128u * 1024u * 1024u);
+    experimentalOpenGLContext.setImageCacheSize(calculateOpenGLImageCacheSize());
     experimentalOpenGLContext.attachTo(*this);
     openGLContextAttached = true;
     openGLIdleStartedMs = juce::Time::getMillisecondCounterHiRes();
@@ -346,6 +351,80 @@ FluorescenceAudioProcessorEditor::~FluorescenceAudioProcessorEditor()
     removeMouseListener(&mouseSpy);
     setLookAndFeel(nullptr);
 }
+#if ALLETIS_FLUORESCENCE_EXPERIMENTAL_OPENGL_UI
+size_t FluorescenceAudioProcessorEditor::calculateOpenGLImageCacheSize() const
+{
+    const auto background = overlayAssets.getSnapshot(FluorescenceOverlayAssets::Slot::background);
+    const auto spectrumOverlay = overlayAssets.getSnapshot(FluorescenceOverlayAssets::Slot::spectrum);
+    std::vector<juce::Image> images {
+        logoSource, logoBlended, alletisSource, brand2Source, eyeSource,
+        background.blurredImage, background.previousBlurredImage,
+        spectrumOverlay.blurredImage, spectrumOverlay.previousBlurredImage
+    };
+    const auto includePendingStartupImage = [&images] (const auto& snapshot)
+    {
+        if(snapshot.blurredImage.isValid() || ! snapshot.settings.imageFile.existsAsFile())
+            return;
+        auto image = juce::ImageFileFormat::loadFrom(snapshot.settings.imageFile);
+        if(! image.isValid())
+            return;
+        constexpr int sourceImageCap = 2048;
+        const int longest = juce::jmax(image.getWidth(), image.getHeight());
+        if(longest > sourceImageCap)
+        {
+            const float factor = (float) sourceImageCap / (float) longest;
+            image = image.rescaled(
+                juce::jmax(1, juce::roundToInt(image.getWidth() * factor)),
+                juce::jmax(1, juce::roundToInt(image.getHeight() * factor)),
+                juce::Graphics::highResamplingQuality);
+        }
+        images.push_back(std::move(image));
+    };
+    includePendingStartupImage(background);
+    includePendingStartupImage(spectrumOverlay);
+    std::vector<juce::Image> uniqueImages;
+    size_t combinedBytes = 0;
+    for(const auto& image : images)
+    {
+        if(! image.isValid())
+            continue;
+        const bool alreadyCounted = std::any_of(uniqueImages.begin(), uniqueImages.end(),
+                                                [&image] (const auto& existing)
+                                                {
+                                                    return existing == image;
+                                                });
+        if(alreadyCounted)
+            continue;
+        uniqueImages.push_back(image);
+        const auto pixels = (size_t) image.getWidth() * (size_t) image.getHeight();
+        combinedBytes += pixels * sizeof(juce::PixelARGB);
+    }
+    const auto maxSize = std::numeric_limits<size_t>::max();
+    const auto requiredBytes = combinedBytes > maxSize / 2 ? maxSize : combinedBytes * 2;
+    size_t cacheSize = 1;
+    while(cacheSize < requiredBytes && cacheSize <= maxSize / 2)
+        cacheSize <<= 1;
+    return cacheSize;
+}
+void FluorescenceAudioProcessorEditor::updateOpenGLImageCacheSize()
+{
+    const auto cacheSize = calculateOpenGLImageCacheSize();
+    if(cacheSize == experimentalOpenGLContext.getImageCacheSize())
+        return;
+    const bool wasAttached = openGLContextAttached;
+    if(wasAttached)
+    {
+        experimentalOpenGLContext.detach();
+        openGLContextAttached = false;
+    }
+    experimentalOpenGLContext.setImageCacheSize(cacheSize);
+    if(wasAttached)
+    {
+        experimentalOpenGLContext.attachTo(*this);
+        openGLContextAttached = true;
+    }
+}
+#endif
 void FluorescenceAudioProcessorEditor::applyModeAlphas()
 {
     const float pianoA = juce::jlimit(0.0f, 1.0f, 1.0f - modePhase);
@@ -960,7 +1039,7 @@ void FluorescenceAudioProcessorEditor::handleGlobalMouseMove(const juce::MouseEv
     {
         const auto p = e.getEventRelativeTo(&content).position.toInt();
         if(logoArea.contains(p))
-            hintText = "-\n\nVersion: 1.1.7";
+            hintText = "-\n\nVersion: 1.1.8";
     }
     hoverHintBox.setHintText(hintText);
     ValueKnob* knob = nullptr;

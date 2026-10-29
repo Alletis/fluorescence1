@@ -409,6 +409,10 @@ private:
     void handleGlobalMouseMove(const juce::MouseEvent&);
     void noteEditorActivity() noexcept;
     void refreshOpenGLContextIfIdle();
+#if ALLETIS_FLUORESCENCE_EXPERIMENTAL_OPENGL_UI
+    size_t calculateOpenGLImageCacheSize() const;
+    void updateOpenGLImageCacheSize();
+#endif
     void parameterValueChanged(int, float) override;
     void parameterGestureChanged(int, bool) override;
     void applySoftwareRenderer();
@@ -654,7 +658,7 @@ private:
                 g.setColour(juce::Colour(0xffc4c4cc)
                                 .withMultipliedAlpha(sharedHeaderAlpha));
                 g.setFont(KnobLookAndFeel::courier(KnobLookAndFeel::uiFont));
-                g.drawText("           Version 1.1.7", row, juce::Justification::centredLeft, false);
+                g.drawText("           Version 1.1.8", row, juce::Justification::centredLeft, false);
                 g.drawText("By Project Alletis           ", row, juce::Justification::centredRight, false);
             }
             const float arrowA = 0.35f + 0.65f * pageAlpha;
