@@ -2,6 +2,7 @@
 #include "PluginEditor.h"
 #include <algorithm>
 #include <complex>
+#include <limits>
 namespace
 {
 inline int overlapFromIndex(int idx) { return idx == 0 ? 4 : (idx == 1 ? 8 : 16); }
@@ -208,6 +209,7 @@ void FluorescenceAudioProcessor::prepareToPlay(double sr, int)
     for(auto& f : transientBypassMask) f.assign(maxBins, (unsigned char) 0);
     for(int ch = 0; ch < maxChannels; ++ch)
     {
+        tsMask[(size_t) ch].reserve(maxBins);
         tsMask[(size_t) ch].setBalance(0.5f);
         tsMask[(size_t) ch].setSeparation(0.85f);
         tsMask[(size_t) ch].setHold(0.2f);
@@ -251,14 +253,21 @@ void FluorescenceAudioProcessor::prepareToPlay(double sr, int)
     peakHarmonic.assign(maxPeaks, 0);
     rawPeaks.clear();
     rawPeaks.reserve(maxPeaks);
+    flatBaseCandidates.clear();
+    flatBaseCandidates.reserve((size_t) maxBases * 3);
     harmonicMap.assign((size_t) maxDetectionPeaks * maxDetectionPeaks, 0);
+    harmonicRelevantPeaks.assign((size_t) maxDetectionPeaks * maxDetectionPeaks, 0);
+    harmonicRelevantCounts.assign(maxDetectionPeaks, 0);
+    salienceScratch.prepare(maxDetectionPeaks);
     for(auto& v : partials) { v.clear(); v.reserve((size_t) maxPeaks * 2); }
     for(auto& v : timeVoices) { v.clear(); v.reserve((size_t) maxPeaks * 2); }
+    for(auto& v : basePhase) { v.clear(); v.reserve((size_t) maxBases * 3); }
     nextPartialId.fill(0);
     timeAdditiveWasEnabled.fill(false);
     peakMatchedPartial.assign(maxPeaks, -1);
     matchCands.clear();
     matchCands.reserve((size_t) maxPeaks * 8);
+    matchPeakOrder.assign(maxPeaks, 0);
     frameCounter = 0;
     baseFreq.assign(maxBases, 0.0f);
     baseSal.assign(maxBases, 0.0f);
@@ -324,6 +333,7 @@ void FluorescenceAudioProcessor::reconfigure(int newOrder, int newOverlap)
 {
     if(newOrder == currentOrder && newOverlap == currentOverlap)
         return;
+    const bool fftOrderChanged = newOrder != currentOrder;
     currentOrder = newOrder;
     currentOverlap = newOverlap;
     fftSize = 1 << newOrder;
@@ -343,7 +353,8 @@ void FluorescenceAudioProcessor::reconfigure(int newOrder, int newOverlap)
     }
     windowCorrection = (float) ((double) hopSize / sumOfSquares);
     spectrumNorm = (windowSum > 0.0) ? (float) (2.0 / windowSum) : 1.0f;
-    buildSynthesisKernel();
+    if(fftOrderChanged)
+        buildSynthesisKernel();
     for(auto& v : partials) v.clear();
     for(auto& v : timeVoices) v.clear();
     for(auto& v : basePhase) v.clear();
@@ -810,10 +821,11 @@ float FluorescenceAudioProcessor::salienceIdx(int candPeak, int harmHorizon) con
     const float nyquist = (float) (sampleRate * 0.5);
     std::array<float, salienceHarmonics + 1> bestByHarmonic {};
     const unsigned char* row = &harmonicMap[(size_t) candPeak * (size_t) maxDetectionPeaks];
-    for(int i = 0; i < numPeaks; ++i)
+    const size_t relevantStart = (size_t) candPeak * (size_t) maxDetectionPeaks;
+    for(int k = 0; k < harmonicRelevantCounts[(size_t) candPeak]; ++k)
     {
+        const int i = harmonicRelevantPeaks[relevantStart + (size_t) k];
         const unsigned char n = row[i];
-        if(n == 0) continue;
         const float amp = peakAmpWork[(size_t) i];
         if(amp <= 0.0f) continue;
         if(amp > bestByHarmonic[(size_t) n]) bestByHarmonic[(size_t) n] = amp;
@@ -1501,13 +1513,24 @@ void FluorescenceAudioProcessor::detect(int channel)
     discoveryConfig.baseLimit = baseLimit;
     discoveryConfig.detectionPeakCapacity = maxDetectionPeaks;
     discoveryConfig.rawPeakLimit = maxPeaks;
+    const float analysisHighHz = effectiveDisableFreqHi();
+    int first = 0, last = numBins;
+    while(first < last)
+    {
+        const int mid = first + (last - first) / 2;
+        if((float) mid * binWidth > analysisHighHz) last = mid;
+        else first = mid + 1;
+    }
+    const int discoveryBins = (first < numBins) ? first + 1 : numBins;
     const auto discovery = base_detection::discover(
-        pvMag.data(), numBins, discoveryConfig,
+        pvMag.data(), discoveryBins, discoveryConfig,
         [this, channel] (int sourceBin, int& analysisBin, float& frequency)
         {
             return resolvePeakObservation(channel, sourceBin, analysisBin, frequency);
         },
-        peakBin, peakFreq, peakAmp, peakAmpWork, harmonicMap, rawPeaks, baseFreq, baseSal);
+        peakBin, peakFreq, peakAmp, peakAmpWork, harmonicMap,
+        harmonicRelevantPeaks, harmonicRelevantCounts, salienceScratch,
+        rawPeaks, baseFreq, baseSal);
     numPeaks = discovery.numPeaks;
     numBases = discovery.numBases;
     const float maxMag = discovery.maxMagnitude;
@@ -1612,6 +1635,7 @@ void FluorescenceAudioProcessor::detect(int channel)
         }
     }
     {
+        int nHiWork = 0;
         for(int i = 0; i < numPeaks; ++i)
         {
             const float fk = peakFreq[(size_t) i];
@@ -1636,11 +1660,9 @@ void FluorescenceAudioProcessor::detect(int channel)
             else
             {
                 peakAmpWork[(size_t) i] = peakAmp[(size_t) i];
+                if(peakAmpWork[(size_t) i] > 0.0f && fk > fMax) ++nHiWork;
             }
         }
-        int nHiWork = 0;
-        for(int i = 0; i < numPeaks; ++i)
-            if(peakAmpWork[(size_t) i] > 0.0f && peakFreq[(size_t) i] > fMax) ++nHiWork;
         hiNumBases = 0;
         float hiFirstSal = 0.0f;
         while(nHiWork > 0 && hiNumBases < baseLimit)
@@ -1707,6 +1729,19 @@ void FluorescenceAudioProcessor::detect(int channel)
     const float tHiSmooth = tHi * tHi * (3.0f - 2.0f * tHi);
     const float minPull = 0.65f * tHiSmooth;
     const float snapMix = tHiSmooth;
+    for(int b = 0; b < numBases; ++b)
+    {
+        const float baseHz = baseFreq[(size_t) b];
+        if(baseHz <= 0.0f)
+        {
+            baseSnapHz[(size_t) b] = 0.0f;
+            continue;
+        }
+        const float heldTarget = baseTargetMidi[(size_t) b];
+        baseSnapHz[(size_t) b] = (heldTarget > -900.0f)
+            ? snapToTargetMidi(baseHz, heldTarget + heldFineSemis, s)
+            : snapBaseToScale(baseHz, s, fineCents);
+    }
     for(int i = 0; i < numPeaks; ++i)
     {
         const float fk = peakFreq[(size_t) i];
@@ -1727,9 +1762,7 @@ void FluorescenceAudioProcessor::detect(int channel)
         const bool isSuper = (fk > fMax);
         const float Fb = baseFreq[(size_t) bestBase];
         const int n = bestN;
-        const float heldTgt = baseTargetMidi[(size_t) bestBase];
-        const float FbS = (heldTgt > -900.0f) ? snapToTargetMidi(Fb, heldTgt + heldFineSemis, s)
-                                              : snapBaseToScale(Fb, s, fineCents);
+        const float FbS = baseSnapHz[(size_t) bestBase];
         const float fk0 = fk;
         const float fkFollow = fk * (FbS / Fb);
         const float ideal = (float) n * FbS;
@@ -1758,9 +1791,7 @@ void FluorescenceAudioProcessor::detect(int channel)
     {
         const float Fbb = baseFreq[(size_t) b];
         if(Fbb <= 0.0f) { baseInvFreq[(size_t) b] = 0.0f; continue; }
-        const float heldTgtB = baseTargetMidi[(size_t) b];
-        const float FbSb = (heldTgtB > -900.0f) ? snapToTargetMidi(Fbb, heldTgtB + heldFineSemis, s)
-                                                : snapBaseToScale(Fbb, s, fineCents);
+        const float FbSb = baseSnapHz[(size_t) b];
         baseInvFreq[(size_t) b] = 1.0f / Fbb;
         baseSnapRatio[(size_t) b] = FbSb / Fbb;
         baseSnapHz[(size_t) b] = FbSb;
@@ -2071,23 +2102,65 @@ void FluorescenceAudioProcessor::updatePartials(int channel)
     const float pmHiR = std::exp2( partialMatchTolCents / 1200.0f);
     const float partialResolutionTolHz = 0.65f
         * juce::jmax(1.0e-6f, binWidth * pitchRatio);
+    int orderedCount = 0;
+    for(int i = 0; i < K; ++i)
+        if(std::isfinite(peakFreq[(size_t) i]) && peakFreq[(size_t) i] > 0.0f)
+            matchPeakOrder[(size_t) orderedCount++] = i;
+    const auto orderBegin = matchPeakOrder.begin();
+    const auto orderEnd = orderBegin + orderedCount;
+    std::sort(orderBegin, orderEnd, [this] (int a, int b)
+    {
+        const float fa = peakFreq[(size_t) a];
+        const float fb = peakFreq[(size_t) b];
+        return fa < fb || (fa == fb && a < b);
+    });
     for(size_t pi = 0; pi < parts.size(); ++pi)
     {
         const float pf = parts[pi].freqNat;
         const float invpf = 1.0f / juce::jmax(1.0e-6f, pf);
-        for(int i = 0; i < K; ++i)
+        auto considerPeak = [&] (int i)
         {
             const float fNat = peakFreq[(size_t) i];
-            if(fNat <= 0.0f) continue;
+            if(fNat <= 0.0f) return;
             const float ratio = fNat * invpf;
             const float dHz = std::abs(fNat - pf);
             const bool nearCents = (ratio > pmLoR && ratio < pmHiR);
             const float ratioDistance = ratio >= 1.0f ? ratio : 1.0f / ratio;
             const bool nearResolution = (dHz <= partialResolutionTolHz && ratioDistance < 1.5f);
-            if(! (nearCents || dHz <= partialMatchTolHz || nearResolution)) continue;
+            if(! (nearCents || dHz <= partialMatchTolHz || nearResolution)) return;
             const float distanceCents = std::abs(1200.0f * std::log2(ratio));
             matchCands.push_back({ distanceCents, (int) pi, i });
+        };
+        const float centsLoHz = pmLoR / invpf;
+        const float centsHiHz = pmHiR / invpf;
+        const float lower = std::min({ centsLoHz, pf - partialMatchTolHz,
+                                       pf - partialResolutionTolHz });
+        const float upper = std::max({ centsHiHz, pf + partialMatchTolHz,
+                                       pf + partialResolutionTolHz });
+        const float guard = 64.0f * std::numeric_limits<float>::epsilon()
+            * std::max({ 1.0f, std::abs(pf), std::abs(lower), std::abs(upper) });
+        const size_t firstCandidate = matchCands.size();
+        if(!std::isfinite(pf) || !std::isfinite(invpf)
+           || !std::isfinite(lower) || !std::isfinite(upper)
+           || !std::isfinite(guard))
+        {
+            for(int i = 0; i < K; ++i)
+                considerPeak(i);
         }
+        else
+        {
+            const auto first = std::lower_bound(orderBegin, orderEnd, lower - guard,
+                [this] (int index, float frequency)
+                { return peakFreq[(size_t) index] < frequency; });
+            const auto last = std::upper_bound(first, orderEnd, upper + guard,
+                [this] (float frequency, int index)
+                { return frequency < peakFreq[(size_t) index]; });
+            for(auto it = first; it != last; ++it)
+                considerPeak(*it);
+        }
+        std::sort(matchCands.begin() + (std::ptrdiff_t) firstCandidate, matchCands.end(),
+                  [] (const MatchCand& a, const MatchCand& b)
+                  { return a.peak < b.peak; });
     }
     std::sort(matchCands.begin(), matchCands.end(),
                [] (const MatchCand& a, const MatchCand& b) { return a.dist < b.dist; });
@@ -3192,7 +3265,8 @@ void FluorescenceAudioProcessor::processFrame(int channel)
         std::fill(capHoldMag[(size_t) channel].begin(), capHoldMag[(size_t) channel].begin() + numBins, 0.0f);
         if(channel == 0)
             numBases = 0;
-        captureSpectrum(channel);
+        if(hasVisualEditor())
+            captureSpectrum(channel);
         fftEngines[(size_t) (currentOrder - minOrder)]->performRealOnlyInverseTransform(fd);
         for(int i = 0; i < wrapSplit; ++i)
             out[(size_t)(pos + i)] += fd[i] * window[(size_t) i] * windowCorrection;
@@ -3204,16 +3278,18 @@ void FluorescenceAudioProcessor::processFrame(int channel)
     {
         tsMask[(size_t) channel].compute(pvMag.data(), tsMaskBuf.data());
         float* sc = tsScratch.data();
-        std::copy(fd, fd + 2 * fftSize, sc);
         for(int k = 0; k < numBins; ++k)
         {
             const float mk = tsMaskBuf[(size_t) k];
             const float full = pvMag[(size_t) k];
+            sc[2 * k] = fd[2 * k];
+            sc[2 * k + 1] = fd[2 * k + 1];
             sc[2 * k] *= mk;
             sc[2 * k + 1] *= mk;
             pvMag[(size_t) k] = full * (1.0f - mk);
             tsDispMag[(size_t) channel][(size_t) k] = full * mk;
         }
+        std::copy(fd + 2 * numBins, fd + 2 * fftSize, sc + 2 * numBins);
         fftEngines[(size_t) (currentOrder - minOrder)]->performRealOnlyInverseTransform(sc);
         for(int i = 0; i < wrapSplit; ++i)
             out[(size_t)(pos + i)] += sc[i] * window[(size_t) i] * windowCorrection;
@@ -3249,7 +3325,8 @@ void FluorescenceAudioProcessor::processFrame(int channel)
         updateTimeAdditiveVoices(channel);
     }
     synthesizeAdditive(channel, reseed);
-    captureSpectrum(channel);
+    if(hasVisualEditor())
+        captureSpectrum(channel);
     fftEngines[(size_t) (currentOrder - minOrder)]->performRealOnlyInverseTransform(fd);
     for(int i = 0; i < wrapSplit; ++i)
         out[(size_t)(pos + i)] += fd[i] * window[(size_t) i] * windowCorrection;
@@ -3360,25 +3437,29 @@ void FluorescenceAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     }
     reconfigure(minOrder + (int) sizeParam->load(),
                  overlapFromIndex((int) overlapParam->load()));
+    const bool visualsActive = hasVisualEditor();
     const int totalIn = getTotalNumInputChannels();
     const int totalOut = getTotalNumOutputChannels();
     for(int ch = totalIn; ch < totalOut; ++ch)
         buffer.clear(ch, 0, buffer.getNumSamples());
-    if(auto* scBus = getBus(true, 1); scBus != nullptr && scBus->isEnabled())
+    if(visualsActive)
     {
-        auto scBuffer = getBusBuffer(buffer, true, 1);
-        float pk = 0.0f;
-        for(int ch = 0; ch < scBuffer.getNumChannels(); ++ch)
-            pk = juce::jmax(pk, scBuffer.getMagnitude(ch, 0, scBuffer.getNumSamples()));
-        scInputPeak.store(pk, std::memory_order_relaxed);
+        if(auto* scBus = getBus(true, 1); scBus != nullptr && scBus->isEnabled())
+        {
+            auto scBuffer = getBusBuffer(buffer, true, 1);
+            float pk = 0.0f;
+            for(int ch = 0; ch < scBuffer.getNumChannels(); ++ch)
+                pk = juce::jmax(pk, scBuffer.getMagnitude(ch, 0, scBuffer.getNumSamples()));
+            scInputPeak.store(pk, std::memory_order_relaxed);
+        }
+        else
+            scInputPeak.store(-1.0f, std::memory_order_relaxed);
     }
-    else
-        scInputPeak.store(-1.0f, std::memory_order_relaxed);
     const bool pvBypassed = (bypassParam == nullptr || bypassParam->load() < 0.5f);
     const bool scBusOn = [this] { auto* b = getBus(true, 1); return b != nullptr && b->isEnabled(); }();
     const bool scMode = (targetMode == 2);
-    const bool scVisualRun = scBusOn && scMode;
-    const bool scRun = scVisualRun && ! pvBypassed;
+    const bool scRun = scBusOn && scMode && ! pvBypassed;
+    const bool scVisualRun = scRun || (visualsActive && scBusOn && scMode);
     SidechainDetector<maxBins, maxBases>::Params scP;
     const float* scIn[2] = { nullptr, nullptr };
     int scNumCh = 0;
@@ -3469,7 +3550,8 @@ void FluorescenceAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
             updateDetectionFrameParams();
             for(int ch = 0; ch < numCh; ++ch)
                 processFrame(ch);
-            publishSpectrum(numCh);
+            if(visualsActive)
+                publishSpectrum(numCh);
         }
     }
 }

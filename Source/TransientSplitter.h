@@ -77,6 +77,11 @@ namespace transientsplit
     class TransientMask
     {
     public:
+        void reserve(int maxBins)
+        {
+            timeMed_.reserve((size_t) maxBins);
+            mask_.reserve((size_t) maxBins);
+        }
         void prepare(int numBins)
         {
             numBins_ = numBins;
@@ -111,12 +116,14 @@ namespace transientsplit
             freqMed_.clear();
             for(int i = 0; i < kFreqHalf; ++i) freqMed_.insert(mag[0]);
             for(int i = 0; i < kFreqHalf; ++i) freqMed_.insert(mag[(size_t) i]);
+            double sum = 0.0;
             for(int i = 0; i < numBins_ - kFreqHalf; ++i)
             {
                 freqMed_.insert(mag[(size_t) (i + kFreqHalf)]);
                 if(feedTime) timeMed_[(size_t) i].insert(mag[(size_t) i]);
                 mask_[(size_t) i] = std::max(mask_[(size_t) i] * cHold_,
                                               portion(freqMed_.getMedian(), timeMed_[(size_t) i].getMedian()));
+                sum += mask_[(size_t) i];
             }
             for(int i = numBins_ - kFreqHalf; i < numBins_; ++i)
             {
@@ -124,9 +131,8 @@ namespace transientsplit
                 if(feedTime) timeMed_[(size_t) i].insert(mag[(size_t) i]);
                 mask_[(size_t) i] = std::max(mask_[(size_t) i] * cHold_,
                                               portion(freqMed_.getMedian(), timeMed_[(size_t) i].getMedian()));
+                sum += mask_[(size_t) i];
             }
-            double sum = 0.0;
-            for(int i = 0; i < numBins_; ++i) sum += mask_[(size_t) i];
             const float mean = (float) (sum / (double) numBins_);
             for(int i = 0; i < numBins_; ++i)
                 maskOut[i] = (mean - mask_[(size_t) i]) * cSmooth_ + mask_[(size_t) i];

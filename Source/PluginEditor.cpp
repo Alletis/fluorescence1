@@ -10,14 +10,19 @@
 #include "ApvtsPresetIO.h"
 #include "Preferences.h"
 #include "OverlayRendering.h"
+#include <array>
+#include <limits>
+#include <vector>
 FluorescenceAudioProcessorEditor::FluorescenceAudioProcessorEditor(FluorescenceAudioProcessor& p)
     : AudioProcessorEditor(p),
       proc(p),
+    overlayAssets(p.getOverlayAssets()),
       spectrum(p.apvts, p.getSpectrumBridge()),
       scSpectrum(p.apvts, p.getSidechainSpectrumBridge()),
       pianoRoll(p.apvts),
       scalePanel(p.apvts)
 {
+    proc.attachVisualEditor();
     setLookAndFeel(&knobLnf);
     addAndMakeVisible(content);
     content.setInterceptsMouseClicks(false, true);
@@ -45,8 +50,14 @@ FluorescenceAudioProcessorEditor::FluorescenceAudioProcessorEditor(FluorescenceA
                               "IMAGE CORRUPTED", file.getFileName());
         }
     });
+    logoFlyout.overlayPage.onLoadSkin = [this] { openSkinChooser(false); };
+    logoFlyout.overlayPage.onSaveSkin = [this] { openSkinChooser(true); };
     overlayAssets.onChanged = [this]
     {
+#if ALLETIS_FLUORESCENCE_EXPERIMENTAL_OPENGL_UI
+        updateOpenGLImageCacheSize();
+#endif
+        noteEditorActivity();
         content.repaint();
         spectrum.repaint();
         scSpectrum.repaint();
@@ -59,6 +70,7 @@ FluorescenceAudioProcessorEditor::FluorescenceAudioProcessorEditor(FluorescenceA
     overlayAssets.startLoading();
     spectrum.setOverlayAssets(&overlayAssets);
     scSpectrum.setOverlayAssets(&overlayAssets);
+    scSpectrum.setOverlayDisplaySource(&spectrum);
     addChildComponent(notification);
     logoSource = juce::ImageCache::getFromMemory(BinaryData::logo_png, BinaryData::logo_pngSize);
     alletisSource = juce::ImageCache::getFromMemory(BinaryData::brand_png, BinaryData::brand_pngSize);
@@ -287,10 +299,13 @@ FluorescenceAudioProcessorEditor::FluorescenceAudioProcessorEditor(FluorescenceA
     bypassMask.primeTo(! bypassModeBtn.getToggleState());
     if(auto* c = getConstrainer())
         c->setFixedAspectRatio((double) baseW / (double) baseH);
+    const float legacyZoom = (float) (double) proc.apvts.state.getProperty("uiZoom", 1.0);
     const float z = juce::jlimit(minZoom, maxZoom,
-                                  (float) (double) proc.apvts.state.getProperty("uiZoom", 1.0));
+                                  FluorescencePreferences::loadUiZoom(legacyZoom));
     uiZoom = z;
     lastSavedZoom = z;
+    proc.apvts.state.setProperty("uiZoom", z, nullptr);
+    FluorescencePreferences::saveUiZoom(z);
     setSize(juce::roundToInt(baseW * z), juce::roundToInt(baseH * z));
     setResizeLimits(juce::roundToInt(baseW * minZoom), juce::roundToInt(baseH * minZoom),
                      juce::roundToInt(baseW * maxZoom), juce::roundToInt(baseH * maxZoom));
@@ -301,6 +316,16 @@ FluorescenceAudioProcessorEditor::FluorescenceAudioProcessorEditor(FluorescenceA
     }
     startTimerHz(60);
     sizeRestoreDone = true;
+#if ALLETIS_FLUORESCENCE_EXPERIMENTAL_OPENGL_UI
+    experimentalOpenGLContext.setComponentPaintingEnabled(true);
+    experimentalOpenGLContext.setContinuousRepainting(false);
+    experimentalOpenGLContext.setImageCacheSize(calculateOpenGLImageCacheSize());
+    experimentalOpenGLContext.attachTo(*this);
+    openGLContextAttached = true;
+    openGLIdleStartedMs = juce::Time::getMillisecondCounterHiRes();
+#endif
+    for(auto* parameter : proc.getParameters())
+        parameter->addListener(this);
     juce::Component::SafePointer<FluorescenceAudioProcessorEditor> safe(this);
     juce::Timer::callAfterDelay(100, [safe]
     {
@@ -312,10 +337,94 @@ FluorescenceAudioProcessorEditor::FluorescenceAudioProcessorEditor(FluorescenceA
 }
 FluorescenceAudioProcessorEditor::~FluorescenceAudioProcessorEditor()
 {
+    for(auto* parameter : proc.getParameters())
+        parameter->removeListener(this);
+#if ALLETIS_FLUORESCENCE_EXPERIMENTAL_OPENGL_UI
+    experimentalOpenGLContext.detach();
+    openGLContextAttached = false;
+#endif
     stopTimer();
+    overlayAssets.onChanged = nullptr;
+    overlayAssets.onImageNotFound = nullptr;
+    overlayAssets.suspendLoading();
+    proc.detachVisualEditor();
     removeMouseListener(&mouseSpy);
     setLookAndFeel(nullptr);
 }
+#if ALLETIS_FLUORESCENCE_EXPERIMENTAL_OPENGL_UI
+size_t FluorescenceAudioProcessorEditor::calculateOpenGLImageCacheSize() const
+{
+    const auto background = overlayAssets.getSnapshot(FluorescenceOverlayAssets::Slot::background);
+    const auto spectrumOverlay = overlayAssets.getSnapshot(FluorescenceOverlayAssets::Slot::spectrum);
+    std::vector<juce::Image> images {
+        logoSource, logoBlended, alletisSource, brand2Source, eyeSource,
+        background.blurredImage, background.previousBlurredImage,
+        spectrumOverlay.blurredImage, spectrumOverlay.previousBlurredImage
+    };
+    const auto includePendingStartupImage = [&images] (const auto& snapshot)
+    {
+        if(snapshot.blurredImage.isValid() || ! snapshot.settings.imageFile.existsAsFile())
+            return;
+        auto image = juce::ImageFileFormat::loadFrom(snapshot.settings.imageFile);
+        if(! image.isValid())
+            return;
+        constexpr int sourceImageCap = 2048;
+        const int longest = juce::jmax(image.getWidth(), image.getHeight());
+        if(longest > sourceImageCap)
+        {
+            const float factor = (float) sourceImageCap / (float) longest;
+            image = image.rescaled(
+                juce::jmax(1, juce::roundToInt(image.getWidth() * factor)),
+                juce::jmax(1, juce::roundToInt(image.getHeight() * factor)),
+                juce::Graphics::highResamplingQuality);
+        }
+        images.push_back(std::move(image));
+    };
+    includePendingStartupImage(background);
+    includePendingStartupImage(spectrumOverlay);
+    std::vector<juce::Image> uniqueImages;
+    size_t combinedBytes = 0;
+    for(const auto& image : images)
+    {
+        if(! image.isValid())
+            continue;
+        const bool alreadyCounted = std::any_of(uniqueImages.begin(), uniqueImages.end(),
+                                                [&image] (const auto& existing)
+                                                {
+                                                    return existing == image;
+                                                });
+        if(alreadyCounted)
+            continue;
+        uniqueImages.push_back(image);
+        const auto pixels = (size_t) image.getWidth() * (size_t) image.getHeight();
+        combinedBytes += pixels * sizeof(juce::PixelARGB);
+    }
+    const auto maxSize = std::numeric_limits<size_t>::max();
+    const auto requiredBytes = combinedBytes > maxSize / 2 ? maxSize : combinedBytes * 2;
+    size_t cacheSize = 1;
+    while(cacheSize < requiredBytes && cacheSize <= maxSize / 2)
+        cacheSize <<= 1;
+    return cacheSize;
+}
+void FluorescenceAudioProcessorEditor::updateOpenGLImageCacheSize()
+{
+    const auto cacheSize = calculateOpenGLImageCacheSize();
+    if(cacheSize == experimentalOpenGLContext.getImageCacheSize())
+        return;
+    const bool wasAttached = openGLContextAttached;
+    if(wasAttached)
+    {
+        experimentalOpenGLContext.detach();
+        openGLContextAttached = false;
+    }
+    experimentalOpenGLContext.setImageCacheSize(cacheSize);
+    if(wasAttached)
+    {
+        experimentalOpenGLContext.attachTo(*this);
+        openGLContextAttached = true;
+    }
+}
+#endif
 void FluorescenceAudioProcessorEditor::applyModeAlphas()
 {
     const float pianoA = juce::jlimit(0.0f, 1.0f, 1.0f - modePhase);
@@ -365,6 +474,42 @@ void FluorescenceAudioProcessorEditor::timerCallback()
         applyModeAlphas();
     }
 }
+void FluorescenceAudioProcessorEditor::noteEditorActivity() noexcept
+{
+#if ALLETIS_FLUORESCENCE_EXPERIMENTAL_OPENGL_UI
+    editorActivitySerial.fetch_add(1, std::memory_order_relaxed);
+#endif
+}
+void FluorescenceAudioProcessorEditor::parameterValueChanged(int, float)
+{
+    noteEditorActivity();
+}
+void FluorescenceAudioProcessorEditor::parameterGestureChanged(int, bool)
+{
+    noteEditorActivity();
+}
+void FluorescenceAudioProcessorEditor::refreshOpenGLContextIfIdle()
+{
+#if ALLETIS_FLUORESCENCE_EXPERIMENTAL_OPENGL_UI
+    const double now = juce::Time::getMillisecondCounterHiRes();
+    const auto activity = editorActivitySerial.load(std::memory_order_relaxed);
+    if(activity != observedEditorActivitySerial)
+    {
+        observedEditorActivitySerial = activity;
+        openGLIdleStartedMs = now;
+        return;
+    }
+    if(! openGLContextAttached || ! isShowing()
+       || now - openGLIdleStartedMs < 30000.0)
+        return;
+    openGLContextAttached = false;
+    experimentalOpenGLContext.detach();
+    experimentalOpenGLContext.attachTo(*this);
+    openGLContextAttached = true;
+    openGLIdleStartedMs = now;
+    repaint();
+#endif
+}
 void FluorescenceAudioProcessorEditor::showTitleContextMenu(juce::Point<int> screenPosition)
 {
     juce::PopupMenu menu;
@@ -372,10 +517,21 @@ void FluorescenceAudioProcessorEditor::showTitleContextMenu(juce::Point<int> scr
     menu.addItem(1, "Init");
     menu.addItem(2, "Load APVTS");
     menu.addItem(3, "Save APVTS");
+    menu.addSeparator();
+    juce::PopupMenu zoomMenu;
+    zoomMenu.setLookAndFeel(&knobLnf);
+    const std::array<float, 6> zoomPresets { 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f };
+    const std::array<const char*, 6> zoomLabels { "50%", "75%", "100%", "125%", "150%", "200%" };
+    for(int i = 0; i < (int) zoomPresets.size(); ++i)
+        zoomMenu.addItem(10 + i, zoomLabels[(size_t) i], true,
+                         std::abs(uiZoom - zoomPresets[(size_t) i]) < 0.01f);
+    menu.addSubMenu("UI Zoom", zoomMenu);
     const auto safe = juce::Component::SafePointer<FluorescenceAudioProcessorEditor>(this);
     const auto anchor = juce::Rectangle<int>(screenPosition.x, screenPosition.y, 1, 1);
-    menu.showMenuAsync(juce::PopupMenu::Options().withTargetScreenArea(anchor),
-                       [safe](int selected)
+    menu.showMenuAsync(juce::PopupMenu::Options()
+                           .withTargetComponent(&content)
+                           .withTargetScreenArea(anchor),
+                       [safe, zoomPresets](int selected)
     {
         if(safe == nullptr) return;
         switch(selected)
@@ -383,9 +539,17 @@ void FluorescenceAudioProcessorEditor::showTitleContextMenu(juce::Point<int> scr
             case 1: safe->initPluginSound(); break;
             case 2: safe->openPresetChooser(false); break;
             case 3: safe->openPresetChooser(true); break;
-            default: break;
+            default:
+                if(selected >= 10 && selected < 16)
+                    safe->setUiZoom(zoomPresets[(size_t) (selected - 10)]);
+                break;
         }
     });
+}
+void FluorescenceAudioProcessorEditor::setUiZoom(float zoom)
+{
+    zoom = juce::jlimit(minZoom, maxZoom, zoom);
+    setSize(juce::roundToInt(baseW * zoom), juce::roundToInt(baseH * zoom));
 }
 void FluorescenceAudioProcessorEditor::initPluginSound()
 {
@@ -407,14 +571,17 @@ void FluorescenceAudioProcessorEditor::initPluginSound()
 }
 void FluorescenceAudioProcessorEditor::openOverlayImageChooser(FluorescenceOverlayAssets::Slot slot)
 {
+    if(overlayAssets.isFileOperationActive())
+    {
+        notification.show(NotificationToast::Kind::warning, "Image is still loading.");
+        return;
+    }
     if(overlayChooser != nullptr)
     {
         notification.show(NotificationToast::Kind::warning, "Finish image selection first.");
         return;
     }
-    const auto current = overlayAssets.getSettings(slot).imageFile;
-    const auto initial = current.existsAsFile() ? current
-        : juce::File::getSpecialLocation(juce::File::userPicturesDirectory);
+    const auto initial = FluorescencePreferences::lastOverlayImageDirectory();
     overlayChooser = std::make_unique<juce::FileChooser>(
         slot == FluorescenceOverlayAssets::Slot::background
             ? "Load background overlay" : "Load spectrum overlay",
@@ -426,29 +593,124 @@ void FluorescenceAudioProcessorEditor::openOverlayImageChooser(FluorescenceOverl
         {
             if(safe == nullptr) return;
             const auto file = chooser.getResult();
+            safe->overlayChooser.reset();
             if(file.existsAsFile())
             {
                 const auto ext = file.getFileExtension().toLowerCase();
                 if(ext == ".png" || ext == ".jpg" || ext == ".jpeg")
                 {
-                    if(juce::ImageFileFormat::loadFrom(file).isValid())
+                    safe->logoFlyout.overlayPage.setImageLoadInProgress(slot, true);
+                    const bool started = safe->overlayAssets.loadImageAsync(
+                        slot, file, [safe, slot, file](juce::Result result)
                     {
-                        safe->overlayAssets.setImageFile(slot, file);
-                        safe->notification.show(
-                            NotificationToast::Kind::info, "OVERLAYED", file.getFileName());
-                    }
-                    else
+                        if(safe == nullptr) return;
+                        safe->logoFlyout.overlayPage.setImageLoadInProgress(slot, false);
+                        if(result.wasOk())
+                        {
+                            FluorescencePreferences::rememberOverlayImageDirectory(
+                                file.getParentDirectory());
+                            safe->logoFlyout.overlayPage.triggerPreview();
+                            safe->notification.show(
+                                NotificationToast::Kind::info, "OVERLAYED", file.getFileName());
+                        }
+                        else
+                            safe->notification.show(
+                                NotificationToast::Kind::critical,
+                                "LOAD FAILED", result.getErrorMessage());
+                    });
+                    if(! started)
                     {
-                        safe->notification.show(
-                            NotificationToast::Kind::critical,
-                            "IMAGE CORRUPTED", file.getFileName());
+                        safe->logoFlyout.overlayPage.setImageLoadInProgress(slot, false);
+                        safe->notification.show(NotificationToast::Kind::warning,
+                                                "Another image load is active.");
                     }
                 }
                 else
                     safe->notification.show(NotificationToast::Kind::critical, "Not an image.", ext);
             }
-            safe->overlayChooser.reset();
         });
+}
+void FluorescenceAudioProcessorEditor::openSkinChooser(bool saving)
+{
+    if(overlayAssets.isFileOperationActive())
+    {
+        notification.show(NotificationToast::Kind::warning,
+                          "Overlay files are still being processed.");
+        return;
+    }
+    if(skinChooser != nullptr)
+    {
+        notification.show(NotificationToast::Kind::warning, "Finish skin selection first.");
+        return;
+    }
+    skinChooser = std::make_unique<juce::FileChooser>(
+        saving ? "Save Fluorescence skin" : "Load Fluorescence skin",
+        FluorescencePreferences::lastSkinDirectory(), "*.fskin", true);
+    const int chooserFlags = saving
+        ? juce::FileBrowserComponent::saveMode
+            | juce::FileBrowserComponent::canSelectFiles
+            | juce::FileBrowserComponent::warnAboutOverwriting
+        : juce::FileBrowserComponent::openMode
+            | juce::FileBrowserComponent::canSelectFiles;
+    const auto safe = juce::Component::SafePointer<FluorescenceAudioProcessorEditor>(this);
+    skinChooser->launchAsync(chooserFlags, [safe, saving](const juce::FileChooser& chooser)
+    {
+        if(safe == nullptr) return;
+        auto file = chooser.getResult();
+        safe->skinChooser.reset();
+        if(file == juce::File()) return;
+        if(saving) file = file.withFileExtension(".fskin");
+        if(! saving)
+        {
+            safe->logoFlyout.overlayPage.setSkinLoadInProgress(true);
+            const bool started = safe->overlayAssets.loadSkinAsync(
+                file, [safe, file](juce::Result result)
+                {
+                    if(safe == nullptr) return;
+                    safe->logoFlyout.overlayPage.setSkinLoadInProgress(false);
+                    if(result.failed())
+                        safe->notification.show(NotificationToast::Kind::critical,
+                                                "LOAD FAILED", result.getErrorMessage());
+                    else
+                    {
+                        FluorescencePreferences::rememberSkinDirectory(file.getParentDirectory());
+                        safe->logoFlyout.overlayPage.refresh();
+                        safe->logoFlyout.overlayPage.triggerPreview();
+                        safe->notification.show(NotificationToast::Kind::info,
+                                                "SKIN LOADED", file.getFileName());
+                    }
+                });
+            if(! started)
+            {
+                safe->logoFlyout.overlayPage.setSkinLoadInProgress(false);
+                safe->notification.show(NotificationToast::Kind::warning,
+                                        "Skin is still loading.");
+            }
+            return;
+        }
+        safe->logoFlyout.overlayPage.setSkinSaveInProgress(true);
+        const bool started = safe->overlayAssets.saveSkinAsync(
+            file, [safe, file](juce::Result result)
+            {
+                if(safe == nullptr) return;
+                safe->logoFlyout.overlayPage.setSkinSaveInProgress(false);
+                if(result.failed())
+                    safe->notification.show(NotificationToast::Kind::critical,
+                                            "SAVE FAILED", result.getErrorMessage());
+                else
+                {
+                    FluorescencePreferences::rememberSkinDirectory(file.getParentDirectory());
+                    safe->notification.show(NotificationToast::Kind::info,
+                                            "SKIN SAVED", file.getFileName());
+                }
+            });
+        if(! started)
+        {
+            safe->logoFlyout.overlayPage.setSkinSaveInProgress(false);
+            safe->notification.show(NotificationToast::Kind::warning,
+                                    "Overlay files are still being processed.");
+        }
+    });
 }
 void FluorescenceAudioProcessorEditor::openPresetChooser(bool saving)
 {
@@ -553,6 +815,8 @@ void FluorescenceAudioProcessorEditor::showReadout(ValueKnob* k, juce::Label* lb
     else
         valueReadout.popIn();
     valueReadout.toFront(false);
+    if(flyoutA.isOpen() && valueReadout.getParentComponent() != &flyoutA)
+        flyoutA.toFront(false);
 }
 void FluorescenceAudioProcessorEditor::scheduleHoverReadoutShow(ValueKnob* knob)
 {
@@ -632,8 +896,10 @@ static juce::Image maxBlendToBg(const juce::Image& src, int w, int h, juce::Colo
 }
 static juce::Image maxBlendToImage(const juce::Image& src, int w, int h,
                                    const juce::Image& background,
+                                   const juce::Image& previousBackground,
                                    juce::Rectangle<int> backgroundArea,
-                                   float backgroundScale)
+                                   juce::Colour base, float loadMultiplier,
+                                   float blurTransition, float backgroundScale)
 {
     if(! src.isValid() || ! background.isValid() || w <= 0 || h <= 0
        || backgroundArea.isEmpty())
@@ -641,7 +907,17 @@ static juce::Image maxBlendToImage(const juce::Image& src, int w, int h,
     juce::Image out(juce::Image::RGB, w, h, false);
     {
         juce::Graphics g(out);
+        g.fillAll(base);
         g.setImageResamplingQuality(juce::Graphics::highResamplingQuality);
+        if(previousBackground.isValid() && blurTransition < 0.9999f)
+        {
+            g.setOpacity(loadMultiplier);
+            g.drawImage(previousBackground, 0, 0, w, h,
+                        backgroundArea.getX(), backgroundArea.getY(),
+                        backgroundArea.getWidth(), backgroundArea.getHeight(), false);
+        }
+        const float blurAlpha = previousBackground.isValid() ? blurTransition : 1.0f;
+        g.setOpacity(loadMultiplier * blurAlpha);
         g.drawImage(background, 0, 0, w, h,
                     backgroundArea.getX(), backgroundArea.getY(),
                     backgroundArea.getWidth(), backgroundArea.getHeight(), false);
@@ -765,7 +1041,7 @@ void FluorescenceAudioProcessorEditor::handleGlobalMouseMove(const juce::MouseEv
     {
         const auto p = e.getEventRelativeTo(&content).position.toInt();
         if(logoArea.contains(p))
-            hintText = "-\n\nVersion: 1.1.7";
+            hintText = "-\n\nVersion: 1.1.8";
     }
     hoverHintBox.setHintText(hintText);
     ValueKnob* knob = nullptr;
@@ -848,6 +1124,7 @@ juce::String FluorescenceAudioProcessorEditor::findHoverHintTextForComponent(juc
 }
 void FluorescenceAudioProcessorEditor::handleGlobalMouseDown(const juce::MouseEvent& e)
 {
+    noteEditorActivity();
     if(logoFlyout.isBlockingMouse())
         return;
     bool onSlider = false, insideFlyout = false, onButton = false, inLogoFlyout = false;
@@ -881,31 +1158,97 @@ void FluorescenceAudioProcessorEditor::paint(juce::Graphics& g)
 }
 void FluorescenceAudioProcessorEditor::ContentComponent::paint(juce::Graphics& g)
 {
+#if ALLETIS_FLUORESCENCE_EXPERIMENTAL_OPENGL_UI && ALLETIS_FLUORESCENCE_GPU_OVERLAY_BACKGROUND
+    if(juce::OpenGLContext::getCurrentContext() != nullptr)
+    {
+        owner.overlayAssets.noteStartupFrame(FluorescenceOverlayAssets::Slot::background);
+        const auto raw = owner.overlayAssets.getSnapshot(FluorescenceOverlayAssets::Slot::background);
+        const float backgroundScale = 1.0f - 0.55f * owner.bypassMask.getAmount();
+        if(gpuBackground.paint(g, baseW, baseH, raw,
+                                owner.logoSource, owner.logoArea,
+                                owner.alletisSource, owner.alletisLink.getBounds(),
+                                owner.dividerX, backgroundScale))
+        {
+            owner.alletisLink.backgroundGpuDrawn.store(true, std::memory_order_relaxed);
+            g.setColour(juce::Colour(0xff2a2a30));
+            g.drawVerticalLine(owner.dividerX, 10.0f, (float) baseH - 10.0f);
+            return;
+        }
+    }
+    owner.alletisLink.backgroundGpuDrawn.store(false, std::memory_order_relaxed);
+#endif
     const auto base = juce::Colour(0xff121216);
     g.fillAll(base);
     const auto s = owner.overlayAssets.getSnapshot(
         FluorescenceOverlayAssets::Slot::background, getWidth(), getHeight());
-    const float effectiveBrightness = s.settings.brightness * s.loadMultiplier;
-    if(s.settings.enabled && s.validImage && effectiveBrightness > 0.0001f)
+    const float brightness = s.settings.brightness;
+    if(s.settings.enabled && s.validImage && brightness > 0.0001f)
     {
         const int w = getWidth(), h = getHeight();
-        if(! cover.isValid() || cachedSource != s.blurredImage ||
-           cover.getWidth() != w || cover.getHeight() != h)
+        if(! cover.isValid() || cachedSource != s.blurredImage
+           || cachedPreviousSource != s.previousBlurredImage)
         {
             cover = s.blurredImage;
+            previousCover = s.previousBlurredImage;
             cachedSource = s.blurredImage;
-            mixed = {}; cachedBrightness = -1.0f;
+            cachedPreviousSource = s.previousBlurredImage;
+            transformed = {};
+            previousTransformed = {};
+            mixed = {};
+            previousMixed = {};
+            cachedBrightness = -1.0f;
+            cachedResize = -1.0f;
+            cachedBoundMode = -1;
         }
-        if(! mixed.isValid() || cachedBrightness != effectiveBrightness)
+        const int boundMode = (int) s.settings.boundMode;
+        const bool transformChanged = ! transformed.isValid()
+            || cachedResize != s.settings.resize
+            || cachedTranslateX != s.settings.translateX
+            || cachedTranslateY != s.settings.translateY
+            || cachedBoundMode != boundMode;
+        if(transformChanged)
         {
-            mixed = OverlayRendering::additiveBackground(cover, base, effectiveBrightness);
-            cachedBrightness = effectiveBrightness;
+            transformed = OverlayRendering::transformImage(
+                cover, w, h, s.settings.resize, s.settings.translateX,
+                s.settings.translateY, s.settings.boundMode);
+            previousTransformed = OverlayRendering::transformImage(
+                previousCover, w, h, s.settings.resize, s.settings.translateX,
+                s.settings.translateY, s.settings.boundMode);
+            cachedResize = s.settings.resize;
+            cachedTranslateX = s.settings.translateX;
+            cachedTranslateY = s.settings.translateY;
+            cachedBoundMode = boundMode;
+            mixed = {};
+            previousMixed = {};
+            cachedBrightness = -1.0f;
         }
-        if(mixed.isValid()) g.drawImageAt(mixed, 0, 0);
+        if(! mixed.isValid() || cachedBrightness != brightness)
+        {
+            mixed = OverlayRendering::additiveBackground(transformed, base, brightness);
+            previousMixed = OverlayRendering::additiveBackground(
+                previousTransformed, base, brightness);
+            cachedBrightness = brightness;
+        }
+        if(previousMixed.isValid() && s.blurTransition < 0.9999f)
+        {
+            g.saveState();
+            g.setOpacity(s.loadMultiplier);
+            g.drawImageAt(previousMixed, 0, 0);
+            g.restoreState();
+        }
+        if(mixed.isValid())
+        {
+            g.saveState();
+            const float blurAlpha = previousMixed.isValid() ? s.blurTransition : 1.0f;
+            g.setOpacity(s.loadMultiplier * blurAlpha);
+            g.drawImageAt(mixed, 0, 0);
+            g.restoreState();
+        }
     }
     else
     {
         mixed = {};
+        previousMixed = {};
         cachedBrightness = -1.0f;
     }
     const float bypassAmount = owner.bypassMask.getAmount();
@@ -918,22 +1261,31 @@ void FluorescenceAudioProcessorEditor::ContentComponent::paint(juce::Graphics& g
     const auto alletisArea = owner.alletisLink.getBounds();
     if(mixed.isValid())
     {
-        if(cachedLogoBackground != mixed || cachedLogoArea != owner.logoArea
+        if(cachedLogoBackground != mixed
+           || cachedLogoPreviousBackground != previousMixed
+           || cachedLogoArea != owner.logoArea
            || cachedAlletisArea != alletisArea
+           || std::abs(cachedLogoLoadMultiplier - s.loadMultiplier) > 0.0001f
+           || std::abs(cachedLogoBlurTransition - s.blurTransition) > 0.0001f
            || std::abs(cachedLogoBackgroundScale - backgroundScale) > 0.0001f)
         {
             const int scale = juce::jmax(1, juce::roundToInt(std::ceil(maxZoom)));
             backgroundLogo = maxBlendToImage(
                 owner.logoSource, owner.logoArea.getWidth() * scale,
-                owner.logoArea.getHeight() * scale, mixed, owner.logoArea,
+                owner.logoArea.getHeight() * scale, mixed, previousMixed,
+                owner.logoArea, base, s.loadMultiplier, s.blurTransition,
                 backgroundScale);
             owner.alletisLink.setImage(maxBlendToImage(
                 owner.alletisSource, alletisArea.getWidth() * scale,
-                alletisArea.getHeight() * scale, mixed, alletisArea,
+                alletisArea.getHeight() * scale, mixed, previousMixed,
+                alletisArea, base, s.loadMultiplier, s.blurTransition,
                 backgroundScale));
             cachedLogoBackground = mixed;
+            cachedLogoPreviousBackground = previousMixed;
             cachedLogoArea = owner.logoArea;
             cachedAlletisArea = alletisArea;
+            cachedLogoLoadMultiplier = s.loadMultiplier;
+            cachedLogoBlurTransition = s.blurTransition;
             cachedLogoBackgroundScale = backgroundScale;
         }
         logosUseBackground = true;
@@ -953,8 +1305,11 @@ void FluorescenceAudioProcessorEditor::ContentComponent::paint(juce::Graphics& g
                 owner.alletisSource, alletisArea.getWidth() * scale,
                 alletisArea.getHeight() * scale, dimmedBase));
             cachedLogoBackground = {};
+            cachedLogoPreviousBackground = {};
             cachedLogoArea = owner.logoArea;
             cachedAlletisArea = alletisArea;
+            cachedLogoLoadMultiplier = -1.0f;
+            cachedLogoBlurTransition = -1.0f;
             cachedLogoBackgroundScale = backgroundScale;
         }
         logosUseBackground = true;
@@ -966,7 +1321,10 @@ void FluorescenceAudioProcessorEditor::ContentComponent::paint(juce::Graphics& g
             owner.alletisSource, alletisArea.getWidth() * scale,
             alletisArea.getHeight() * scale, base));
         cachedLogoBackground = {};
+        cachedLogoPreviousBackground = {};
         backgroundLogo = {};
+        cachedLogoLoadMultiplier = -1.0f;
+        cachedLogoBlurTransition = -1.0f;
         cachedLogoBackgroundScale = -1.0f;
         logosUseBackground = false;
     }
@@ -994,18 +1352,22 @@ void FluorescenceAudioProcessorEditor::applySoftwareRenderer()
 }
 void FluorescenceAudioProcessorEditor::parentHierarchyChanged()
 {
+    noteEditorActivity();
     applySoftwareRenderer();
 }
 void FluorescenceAudioProcessorEditor::visibilityChanged()
 {
+    noteEditorActivity();
     if(isShowing())
         applySoftwareRenderer();
 }
 void FluorescenceAudioProcessorEditor::resized()
 {
+    noteEditorActivity();
     const float sx = (float) getWidth() / (float) baseW;
     const float sy = (float) getHeight() / (float) baseH;
     uiZoom = juce::jlimit(minZoom, maxZoom, sx);
+    proc.apvts.state.setProperty("uiZoom", uiZoom, nullptr);
     content.setTransform(juce::AffineTransform::scale(sx, sy));
     content.setBounds(0, 0, baseW + 2, baseH + 2);
     logoFlyout.setTransform(juce::AffineTransform::scale(sx, sy));
@@ -1250,10 +1612,12 @@ void FluorescenceAudioProcessorEditor::resized()
         moreBasesBtn.setBounds(rowX + toggleColW, tY, toggleColW - tGap, toggleH);
         hysteresisBtn.setBounds(rowX + toggleColW * 2, tY, rowW - toggleColW * 2, toggleH);
     }
+    if(flyoutA.isOpen())
+        flyoutA.toFront(false);
     repaint();
     if(sizeRestoreDone && std::abs(uiZoom - lastSavedZoom) > 0.001f)
     {
         lastSavedZoom = uiZoom;
-        proc.apvts.state.setProperty("uiZoom", (double) uiZoom, nullptr);
+        FluorescencePreferences::saveUiZoom(uiZoom);
     }
 }

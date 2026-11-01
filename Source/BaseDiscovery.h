@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <vector>
 namespace base_detection
 {
@@ -29,6 +30,21 @@ struct Config
     int detectionPeakCapacity = 128;
     int rawPeakLimit = 2048;
 };
+struct SalienceScratch
+{
+    std::vector<unsigned char> activeHarmonics;
+    std::vector<float> cachedScores;
+    std::vector<std::uint64_t> validWords;
+    std::vector<std::uint64_t> reverseDependencies;
+    void prepare(int peakCapacity)
+    {
+        const int words = (peakCapacity + 63) / 64;
+        activeHarmonics.assign((size_t) peakCapacity, 0);
+        cachedScores.assign((size_t) peakCapacity, 0.0f);
+        validWords.assign((size_t) words, 0);
+        reverseDependencies.assign((size_t) peakCapacity * (size_t) words, 0);
+    }
+};
 struct Result
 {
     int numPeaks = 0;
@@ -45,6 +61,9 @@ Result discover(const float* magnitude, int numBins, const Config& config,
                 std::vector<float>& peakAmp,
                 std::vector<float>& peakWork,
                 std::vector<unsigned char>& harmonicMap,
+                std::vector<unsigned short>& harmonicRelevantPeaks,
+                std::vector<int>& harmonicRelevantCounts,
+                SalienceScratch& salienceScratch,
                 std::vector<RawPeak>& rawPeaks,
                 std::vector<float>& baseFreq,
                 std::vector<float>& baseSal) noexcept
@@ -69,7 +88,14 @@ Result discover(const float* magnitude, int numBins, const Config& config,
                                         (int) peakFreq.size(), (int) peakAmp.size(),
                                         (int) peakWork.size() });
     const int mapStride = peakCapacity;
-    if(peakCapacity <= 0 || (int) harmonicMap.size() < mapStride * mapStride)
+    const int candidateWords = (peakCapacity + 63) / 64;
+    if(peakCapacity <= 0 || (int) harmonicMap.size() < mapStride * mapStride
+       || (int) harmonicRelevantPeaks.size() < mapStride * mapStride
+       || (int) harmonicRelevantCounts.size() < peakCapacity
+       || (int) salienceScratch.activeHarmonics.size() < peakCapacity
+       || (int) salienceScratch.cachedScores.size() < peakCapacity
+       || (int) salienceScratch.validWords.size() < candidateWords
+       || (int) salienceScratch.reverseDependencies.size() < peakCapacity * candidateWords)
         return result;
     const float floorMagnitude = result.maxMagnitude * peakFloorRel;
     const float harmonicFloor = juce::jmax(1.0e-12f,
@@ -144,54 +170,136 @@ Result discover(const float* magnitude, int numBins, const Config& config,
     }
     if(result.numPeaks == 0)
         return result;
+    std::fill(harmonicRelevantCounts.begin(),
+              harmonicRelevantCounts.begin() + result.numPeaks, 0);
+    std::fill(salienceScratch.validWords.begin(),
+              salienceScratch.validWords.begin() + candidateWords, 0);
+    std::fill(salienceScratch.reverseDependencies.begin(),
+              salienceScratch.reverseDependencies.begin()
+                + (size_t) result.numPeaks * (size_t) candidateWords, 0);
     const float toleranceLo = std::exp2(-config.centsTolerance / 1200.0f);
     const float toleranceHi = std::exp2( config.centsTolerance / 1200.0f);
+    float highestObservedHz = 0.0f;
+    for(int peak = 0; peak < result.numPeaks; ++peak)
+    {
+        highestObservedHz = std::max(highestObservedHz, peakFreq[(size_t) peak]);
+        peakWork[(size_t) peak] = peakAmp[(size_t) peak];
+        result.totalPeak += peakAmp[(size_t) peak];
+    }
+    const float highestPossibleTargetHz =
+        (highestObservedHz / toleranceLo) * 1.001f;
     for(int candidate = 0; candidate < result.numPeaks; ++candidate)
     {
         const float fundamental = peakFreq[(size_t) candidate];
         unsigned char* row = harmonicMap.data() + (size_t) candidate * (size_t) mapStride;
         const float inverseFundamental = 1.0f / fundamental;
+        int activeHarmonics = 0;
+        const float nyquist = (float) (config.sampleRate * 0.5);
+        if(std::isfinite(fundamental) && fundamental > 0.0f
+           && std::isfinite(nyquist) && nyquist > 0.0f)
+        {
+            if((float) salienceHarmonics * fundamental < nyquist)
+                activeHarmonics = salienceHarmonics;
+            else if(fundamental < nyquist)
+            {
+                activeHarmonics = std::min(salienceHarmonics,
+                    (int) (nyquist / fundamental));
+                while(activeHarmonics > 0
+                    && (float) activeHarmonics * fundamental >= nyquist)
+                    --activeHarmonics;
+                while(activeHarmonics < salienceHarmonics
+                    && (float) (activeHarmonics + 1) * fundamental < nyquist)
+                    ++activeHarmonics;
+            }
+        }
+        else
+        {
+            for(int h = 1; h <= salienceHarmonics; ++h)
+            {
+                const float target = (float) h * fundamental;
+                if(target >= nyquist) break;
+                ++activeHarmonics;
+            }
+        }
+        if(std::isfinite(highestPossibleTargetHz))
+            while(activeHarmonics > 0
+                && (float) activeHarmonics * fundamental > highestPossibleTargetHz)
+                --activeHarmonics;
+        salienceScratch.activeHarmonics[(size_t) candidate] =
+            (unsigned char) activeHarmonics;
+        if(activeHarmonics == 0)
+        {
+            std::fill(row, row + result.numPeaks, (unsigned char) 0);
+            continue;
+        }
+        const bool canRejectDistantPeaks = toleranceLo > 0.90f
+            && toleranceHi < 1.10f;
+        const float coarseMinHz = fundamental * 0.80f;
+        const float coarseMaxHz =
+            ((float) activeHarmonics * fundamental) * 1.20f;
         for(int peak = 0; peak < result.numPeaks; ++peak)
         {
             const float partial = peakFreq[(size_t) peak];
+            if(canRejectDistantPeaks && (partial < coarseMinHz || partial > coarseMaxHz))
+            {
+                row[peak] = 0;
+                continue;
+            }
             const int harmonic = (int) (partial * inverseFundamental + 0.5f);
             unsigned char mappedHarmonic = 0;
-            if(harmonic >= 1 && harmonic <= salienceHarmonics)
+            if(harmonic >= 1 && harmonic <= activeHarmonics)
             {
                 const float target = (float) harmonic * fundamental;
                 const float ratio = partial / target;
-                if(target < (float) (config.sampleRate * 0.5)
-                   && ratio > toleranceLo && ratio < toleranceHi)
+                if(ratio > toleranceLo && ratio < toleranceHi)
                     mappedHarmonic = (unsigned char) harmonic;
             }
             row[peak] = mappedHarmonic;
+            if(mappedHarmonic != 0)
+            {
+                harmonicRelevantPeaks[(size_t) candidate * (size_t) mapStride
+                    + (size_t) harmonicRelevantCounts[(size_t) candidate]++] =
+                    (unsigned short) peak;
+                salienceScratch.reverseDependencies[
+                    (size_t) peak * (size_t) candidateWords + (size_t) (candidate >> 6)]
+                    |= std::uint64_t(1) << (candidate & 63);
+            }
         }
-    }
-    for(int peak = 0; peak < result.numPeaks; ++peak)
-    {
-        peakWork[(size_t) peak] = peakAmp[(size_t) peak];
-        result.totalPeak += peakAmp[(size_t) peak];
     }
     auto salience = [&] (int candidate)
     {
+        const int word = candidate >> 6;
+        const auto bit = std::uint64_t(1) << (candidate & 63);
+        if((salienceScratch.validWords[(size_t) word] & bit) != 0)
+            return salienceScratch.cachedScores[(size_t) candidate];
         const float fundamental = peakFreq[(size_t) candidate];
         const unsigned char* row = harmonicMap.data()
                                  + (size_t) candidate * (size_t) mapStride;
-        std::array<float, 33> bestByHarmonic {};
-        for(int peak = 0; peak < result.numPeaks; ++peak)
+        const int activeHarmonics = salienceScratch.activeHarmonics[(size_t) candidate];
+        if(activeHarmonics == 0)
         {
+            salienceScratch.cachedScores[(size_t) candidate] = 0.0f;
+            salienceScratch.validWords[(size_t) word] |= bit;
+            return 0.0f;
+        }
+        std::array<float, 33> bestByHarmonic {};
+        const size_t relevantStart = (size_t) candidate * (size_t) mapStride;
+        for(int k = 0; k < harmonicRelevantCounts[(size_t) candidate]; ++k)
+        {
+            const int peak = harmonicRelevantPeaks[relevantStart + (size_t) k];
             const int harmonic = row[peak];
-            if(harmonic > 0 && peakWork[(size_t) peak] > bestByHarmonic[(size_t) harmonic])
+            if(peakWork[(size_t) peak] > bestByHarmonic[(size_t) harmonic])
                 bestByHarmonic[(size_t) harmonic] = peakWork[(size_t) peak];
         }
         float sum = 0.0f;
-        for(int harmonic = 1; harmonic <= salienceHarmonics; ++harmonic)
+        for(int harmonic = 1; harmonic <= activeHarmonics; ++harmonic)
         {
             const float target = (float) harmonic * fundamental;
-            if(target >= (float) (config.sampleRate * 0.5)) break;
             sum += ((fundamental + salAlpha) / (target + salBeta))
                  * bestByHarmonic[(size_t) harmonic];
         }
+        salienceScratch.cachedScores[(size_t) candidate] = sum;
+        salienceScratch.validWords[(size_t) word] |= bit;
         return sum;
     };
     while(result.numBases < juce::jmin(config.baseLimit, (int) baseFreq.size()))
@@ -271,7 +379,15 @@ Result discover(const float* magnitude, int numBins, const Config& config,
             const float sigma = juce::jlimit(low, juce::jmax(low, membershipSigmaCents),
                                               membershipGapFrac * gapCents);
             const float z = 1200.0f * std::log2(ratio) / sigma;
+            const float previousWork = peakWork[(size_t) peak];
             peakWork[(size_t) peak] *= 1.0f - depth * std::exp(-z * z);
+            if(peakWork[(size_t) peak] != previousWork)
+            {
+                const size_t reverseStart = (size_t) peak * (size_t) candidateWords;
+                for(int word = 0; word < candidateWords; ++word)
+                    salienceScratch.validWords[(size_t) word] &=
+                        ~salienceScratch.reverseDependencies[reverseStart + (size_t) word];
+            }
         }
     }
     return result;

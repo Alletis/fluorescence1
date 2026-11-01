@@ -6,6 +6,7 @@
 #include "SpectrumBridge.h"
 #include "SidechainDetector.h"
 #include "TransientSplitter.h"
+#include "OverlayAssets.h"
 class FluorescenceAudioProcessor : public juce::AudioProcessor,
                                   private juce::AsyncUpdater
 {
@@ -31,11 +32,25 @@ public:
     void getStateInformation(juce::MemoryBlock& destData) override;
     void setStateInformation(const void* data, int sizeInBytes) override;
     juce::AudioProcessorValueTreeState apvts;
+    FluorescenceOverlayAssets& getOverlayAssets() noexcept { return overlayAssets; }
+    void attachVisualEditor() noexcept
+    {
+        visualEditorCount.fetch_add(1, std::memory_order_relaxed);
+    }
+    void detachVisualEditor() noexcept
+    {
+        visualEditorCount.fetch_sub(1, std::memory_order_relaxed);
+    }
+    bool hasVisualEditor() const noexcept
+    {
+        return visualEditorCount.load(std::memory_order_relaxed) > 0;
+    }
     bool claimFirstEditorHintFlash() noexcept
     {
         return firstEditorHintFlashPending.exchange(false, std::memory_order_relaxed);
     }
 private:
+    FluorescenceOverlayAssets overlayAssets;
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
     void reconfigure(int newOrder, int newOverlap);
     void processFrame(int channel);
@@ -48,6 +63,9 @@ private:
     bool resolvePeakObservation(int channel, int sourceBin, int& analysisBin, float& peakHz) const;
     void rebuildHarmonicPeakList(int channel, float frameMaxMag);
     std::vector<unsigned char> harmonicMap;
+    std::vector<unsigned short> harmonicRelevantPeaks;
+    std::vector<int> harmonicRelevantCounts;
+    base_detection::SalienceScratch salienceScratch;
     float snapBaseToScale(float baseHz, float amount, float fineCents) const;
     float nearestTargetMidi(float baseHz) const;
     float snapToTargetMidi(float baseHz, float targetMidi, float amount) const;
@@ -303,6 +321,7 @@ private:
     std::array<int, maxChannels> nextPartialId {};
     std::vector<int> peakMatchedPartial;
     std::vector<MatchCand> matchCands;
+    std::vector<int> matchPeakOrder;
     int64_t frameCounter = 0;
     static constexpr int kernelHalf = 3;
     static constexpr int kernelOS = 512;
@@ -442,6 +461,7 @@ private:
     void handleAsyncUpdate() override;
     std::atomic<int> pendingLatency { 0 };
     std::atomic<bool> firstEditorHintFlashPending { true };
+    std::atomic<int> visualEditorCount { 0 };
 public:
     using SpectrumBridgeType = SpectrumBridge<maxBins, maxBases>;
     SpectrumBridgeType& getSpectrumBridge() noexcept { return spectrumBridge; }

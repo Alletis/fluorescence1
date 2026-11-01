@@ -1,5 +1,11 @@
 #pragma once
 #include <juce_audio_processors/juce_audio_processors.h>
+#ifndef ALLETIS_FLUORESCENCE_EXPERIMENTAL_OPENGL_UI
+ #define ALLETIS_FLUORESCENCE_EXPERIMENTAL_OPENGL_UI 0
+#endif
+#if ALLETIS_FLUORESCENCE_EXPERIMENTAL_OPENGL_UI
+ #include <juce_opengl/juce_opengl.h>
+#endif
 #include "PluginProcessor.h"
 #include "KnobLookAndFeel.h"
 #include "ValueKnob.h"
@@ -13,7 +19,14 @@
 #include "NotificationToast.h"
 #include "OverlayAssets.h"
 #include "OverlaySettingsPage.h"
+#ifndef ALLETIS_FLUORESCENCE_GPU_OVERLAY_BACKGROUND
+ #define ALLETIS_FLUORESCENCE_GPU_OVERLAY_BACKGROUND 1
+#endif
+#if ALLETIS_FLUORESCENCE_EXPERIMENTAL_OPENGL_UI && ALLETIS_FLUORESCENCE_GPU_OVERLAY_BACKGROUND
+ #include "GpuOverlayBackground.h"
+#endif
 #include <cmath>
+#include <atomic>
 #include <functional>
 class ValueReadout : public juce::Component
                   , private juce::Timer
@@ -342,6 +355,11 @@ public:
     void setURL(juce::String u) { url = std::move(u); }
     void paint(juce::Graphics& g) override
     {
+        #if ALLETIS_FLUORESCENCE_EXPERIMENTAL_OPENGL_UI && ALLETIS_FLUORESCENCE_GPU_OVERLAY_BACKGROUND
+        if(juce::OpenGLContext::getCurrentContext() != nullptr
+            && backgroundGpuDrawn.load(std::memory_order_relaxed))
+            return;
+        #endif
         if(img.isValid())
             g.drawImage(img, getLocalBounds().toFloat());
     }
@@ -353,9 +371,13 @@ public:
 private:
     juce::Image img;
     juce::String url;
+public:
+    std::atomic<bool> backgroundGpuDrawn { false };
+private:
 };
 class FluorescenceAudioProcessorEditor : public juce::AudioProcessorEditor,
-                                       private juce::Timer
+                                       private juce::Timer,
+                                       private juce::AudioProcessorParameter::Listener
 {
 public:
     explicit FluorescenceAudioProcessorEditor(FluorescenceAudioProcessor&);
@@ -372,7 +394,9 @@ private:
     void setupKnob(ValueKnob&, const juce::String& paramId, std::unique_ptr<SA>&);
     void openPresetChooser(bool saving);
     void openOverlayImageChooser(FluorescenceOverlayAssets::Slot slot);
+    void openSkinChooser(bool saving);
     void showTitleContextMenu(juce::Point<int> screenPosition);
+    void setUiZoom(float zoom);
     void initPluginSound();
     void wireReadout(ValueKnob&, juce::Label&);
     enum class ReadoutMode { none, hover, drag };
@@ -383,29 +407,55 @@ private:
     void rebuildLogo();
     void handleGlobalMouseDown(const juce::MouseEvent&);
     void handleGlobalMouseMove(const juce::MouseEvent&);
+    void noteEditorActivity() noexcept;
+    void refreshOpenGLContextIfIdle();
+#if ALLETIS_FLUORESCENCE_EXPERIMENTAL_OPENGL_UI
+    size_t calculateOpenGLImageCacheSize() const;
+    void updateOpenGLImageCacheSize();
+#endif
+    void parameterValueChanged(int, float) override;
+    void parameterGestureChanged(int, bool) override;
     void applySoftwareRenderer();
+#if ALLETIS_FLUORESCENCE_EXPERIMENTAL_OPENGL_UI
+    juce::OpenGLContext experimentalOpenGLContext;
+    std::atomic<juce::uint64> editorActivitySerial { 1 };
+    juce::uint64 observedEditorActivitySerial = 0;
+    double openGLIdleStartedMs = 0.0;
+    bool openGLContextAttached = false;
+#endif
     juce::Label* findReadoutLabelForKnob(ValueKnob* knob);
     juce::String findHoverHintTextForComponent(juce::Component* eventComponent) const;
     FluorescenceAudioProcessor& proc;
     KnobLookAndFeel knobLnf;
-    FluorescenceOverlayAssets overlayAssets;
+    FluorescenceOverlayAssets& overlayAssets;
     struct ContentComponent : juce::Component
     {
         FluorescenceAudioProcessorEditor& owner;
         explicit ContentComponent(FluorescenceAudioProcessorEditor& o) : owner(o) {}
         void paint(juce::Graphics&) override;
-        juce::Image cover, mixed, cachedSource;
-        juce::Image cachedLogoBackground, backgroundLogo;
+        juce::Image cover, transformed, mixed, cachedSource;
+        juce::Image previousCover, previousTransformed, previousMixed, cachedPreviousSource;
+        juce::Image cachedLogoBackground, cachedLogoPreviousBackground, backgroundLogo;
         juce::Rectangle<int> cachedLogoArea, cachedAlletisArea;
         bool logosUseBackground = false;
         float cachedLogoBackgroundScale = -1.0f;
+        float cachedLogoLoadMultiplier = -1.0f;
+        float cachedLogoBlurTransition = -1.0f;
         float cachedBrightness = -1.0f;
+        float cachedResize = -1.0f;
+        float cachedTranslateX = 0.0f;
+        float cachedTranslateY = 0.0f;
+        int cachedBoundMode = -1;
+#if ALLETIS_FLUORESCENCE_EXPERIMENTAL_OPENGL_UI && ALLETIS_FLUORESCENCE_GPU_OVERLAY_BACKGROUND
+        FluorescenceGpuBackground gpuBackground;
+#endif
     };
     ContentComponent content { *this };
     NotificationToast notification;
     SmoothTextButton bypassModeBtn { "ACTIVE" };
     std::unique_ptr<juce::FileChooser> presetChooser;
     std::unique_ptr<juce::FileChooser> overlayChooser;
+    std::unique_ptr<juce::FileChooser> skinChooser;
     bool presetChooserActive = false;
     SmoothComboBox fftSizeBox, overlapBox;
     SmoothToggleButton fullMidiBtn { "FULL MIDI" };
@@ -456,8 +506,8 @@ private:
     int dividerX = 0;
     static constexpr int baseW = 760;
     static constexpr int baseH = 540;
-    static constexpr float minZoom = 0.75f;
-    static constexpr float maxZoom = 2.5f;
+    static constexpr float minZoom = 0.5f;
+    static constexpr float maxZoom = 2.0f;
     float uiZoom = 1.0f;
     float lastSavedZoom = -1.0f;
     bool sizeRestoreDone = false;
@@ -583,29 +633,32 @@ private:
         void setPanelRect(juce::Rectangle<int> r) { panelRect = r; layoutOverlayPage(); repaint(); }
         void layoutOverlayPage()
         {
-            if(logoRect.isEmpty()) return;
-            auto r = panelRect.reduced(37, 0);
-            r.setTop(logoRect.getBottom() + 23);
-            r.setBottom(panelRect.getBottom());
-            overlayPage.setBounds(r);
+            overlayPage.setBounds(panelRect.reduced(37, 16));
         }
         void setLogo(juce::Image img, juce::Rectangle<int> r) { logoImg = std::move(img); logoRect = r; layoutOverlayPage(); repaint(); }
         void setPageLogos(juce::Image eye, juce::Image brand2) { eyeImg = std::move(eye); brand2Img = std::move(brand2); repaint(); }
         void paint(juce::Graphics& g) override
         {
-            g.fillAll(juce::Colours::black.withAlpha(0.6f));
+            g.fillAll(juce::Colours::black.withAlpha(0.6f * (1.0f - overlayPreviewAmount)));
             auto p = panelRect.toFloat();
-            g.setColour(juce::Colour(0xff17171c));
+            g.setColour(juce::Colour(0xff17171c).withAlpha(1.0f - 0.7f * overlayPreviewAmount));
             g.fillRoundedRectangle(p, 12.0f);
             g.setColour(juce::Colour(0xff45aeb1));
             g.drawRoundedRectangle(p, 12.0f, 1.2f);
-            if(logoImg.isValid())
+            if(sharedHeaderAlpha > 0.001f && logoImg.isValid())
+            {
+                g.saveState();
+                g.setOpacity(sharedHeaderAlpha);
                 g.drawImage(logoImg, logoRect.toFloat());
+                g.restoreState();
+            }
+            if(sharedHeaderAlpha > 0.001f)
             {
                 auto row = panelRect.reduced(24, 0).withTop(logoRect.getBottom() + 4).withHeight(18);
-                g.setColour(juce::Colour(0xffc4c4cc));
+                g.setColour(juce::Colour(0xffc4c4cc)
+                                .withMultipliedAlpha(sharedHeaderAlpha));
                 g.setFont(KnobLookAndFeel::courier(KnobLookAndFeel::uiFont));
-                g.drawText("           Version 1.1.7", row, juce::Justification::centredLeft, false);
+                g.drawText("           Version 1.1.8", row, juce::Justification::centredLeft, false);
                 g.drawText("By Project Alletis           ", row, juce::Justification::centredRight, false);
             }
             const float arrowA = 0.35f + 0.65f * pageAlpha;
@@ -650,7 +703,6 @@ private:
             }
             else
             {
-                drawSection(g, "IMAGE OVERLAYS", logoRect.getBottom() + 34, pageAlpha);
             }
         }
         void mouseDown(const juce::MouseEvent& e) override
@@ -741,6 +793,45 @@ private:
         }
         void timerCallback() override
         {
+            const double now = juce::Time::getMillisecondCounterHiRes();
+            const auto editRevision = overlayPage.getEditRevision();
+            const bool previewActive = page == 2 && overlayPage.isPreviewingOverlay();
+            if(previewActive || editRevision != observedOverlayEditRevision)
+            {
+                observedOverlayEditRevision = editRevision;
+                overlayPreviewLastActivityMs = now;
+            }
+            constexpr double previewHoldMs = 500.0;
+            const bool previewHeld = page == 2
+                && overlayPreviewLastActivityMs >= 0.0
+                && now - overlayPreviewLastActivityMs < previewHoldMs;
+            const float previewTarget = previewActive || previewHeld ? 1.0f : 0.0f;
+            const float previewDelta = previewTarget - overlayPreviewAmount;
+            if(std::abs(previewDelta) > 0.001f)
+            {
+                overlayPreviewAmount += previewDelta * 0.22f;
+                repaint();
+            }
+            else if(overlayPreviewAmount != previewTarget)
+            {
+                overlayPreviewAmount = previewTarget;
+                repaint();
+            }
+            overlayPage.setControlFillAlpha(1.0f - 0.6f * overlayPreviewAmount);
+            const bool overlaySettingsStillVisible = page == 2 && pageWanted != 2;
+            const float sharedHeaderTarget = pageWanted == 2
+                || overlaySettingsStillVisible ? 0.0f : 1.0f;
+            const float sharedHeaderDelta = sharedHeaderTarget - sharedHeaderAlpha;
+            if(std::abs(sharedHeaderDelta) > 0.001f)
+            {
+                sharedHeaderAlpha += sharedHeaderDelta * (1.0f / 3.0f);
+                repaint();
+            }
+            else if(sharedHeaderAlpha != sharedHeaderTarget)
+            {
+                sharedHeaderAlpha = sharedHeaderTarget;
+                repaint();
+            }
             const float t = open ? 1.0f : 0.0f;
             if(! animInProgress || t != animEnd)
             {
@@ -796,6 +887,10 @@ private:
         int page = 0, pageWanted = 0;
         float pageAlpha = 1.0f;
         float pagePhase = 1.0f;
+        float sharedHeaderAlpha = 1.0f;
+        float overlayPreviewAmount = 0.0f;
+        double overlayPreviewLastActivityMs = -1.0;
+        juce::uint64 observedOverlayEditRevision = 0;
         static constexpr float pageStep = 1.0f / 9.0f;
         juce::Rectangle<int> panelRect;
         juce::Image logoImg;

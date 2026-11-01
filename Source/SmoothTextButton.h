@@ -15,6 +15,11 @@ public:
     bool isActive() const noexcept { return active; }
     void setMagentaAccent(bool enabled) { magentaAccent = enabled; }
     void setNeutralStyle(bool enabled) { neutralStyle = enabled; }
+    void setFillAlpha(float alpha)
+    {
+        fillAlpha = juce::jlimit(0.0f, 1.0f, alpha);
+        repaint();
+    }
     void setStatusIndicatorEnabled(bool enabled)
     {
         if(statusIndicatorEnabled == enabled) return;
@@ -41,7 +46,7 @@ public:
             paintStatusButton(g, b, corner);
             return;
         }
-        g.setColour(fillS.get());
+        g.setColour(fillS.get().withMultipliedAlpha(fillAlpha));
         g.fillRoundedRectangle(b, corner);
         g.setColour(lineS.get());
         g.drawRoundedRectangle(b, corner, 1.2f);
@@ -128,7 +133,7 @@ private:
             .interpolatedWith(juce::Colour(0xffdddde4), v.hovered);
         textColour = textColour.interpolatedWith(juce::Colour(0xffb8b8c0), v.pressed);
         textColour = juce::Colour(0xff55555c).interpolatedWith(textColour, v.enabled);
-        g.setColour(fill);
+        g.setColour(fill.withMultipliedAlpha(fillAlpha));
         g.fillRoundedRectangle(b, corner);
         const auto font = KnobLookAndFeel::courier(
             juce::jmin(14.0f, b.getHeight() * 0.50f));
@@ -147,7 +152,7 @@ private:
         const auto borderStop = [&](float fraction) -> juce::Colour
         {
             const auto lerpColour = oklch::lerp(teal, magenta, fraction);
-            const auto activeColour = lerpColour.withSaturation(0.47f).withBrightness(0.95 * lerpColour.getBrightness());
+            const auto activeColour = lerpColour.withSaturation(0.47f).withBrightness(0.95f * lerpColour.getBrightness());
             const auto stateColour = oklch::lerp(off, activeColour, v.active);
             return oklch::lerp(disabledGrey, stateColour, v.enabled);
         };
@@ -231,6 +236,7 @@ private:
     bool active = false;
     bool magentaAccent = false;
     bool neutralStyle = false;
+    float fillAlpha = 1.0f;
     bool statusIndicatorEnabled = false;
     bool statusPrimed = false;
     double statusStartMs = 0.0;

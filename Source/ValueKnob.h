@@ -5,6 +5,7 @@
 #include "Oklch.h"
 #include <cstdlib>
 #include <cmath>
+#include <functional>
 class ValueKnob : public juce::Slider,
                   private juce::Timer
 {
@@ -68,6 +69,16 @@ public:
         dragging = false;
         juce::Slider::mouseUp(e);
     }
+    void mouseEnter(const juce::MouseEvent& e) override
+    {
+        if(onHoverChanged) onHoverChanged(true);
+        juce::Slider::mouseEnter(e);
+    }
+    void mouseExit(const juce::MouseEvent& e) override
+    {
+        if(onHoverChanged) onHoverChanged(false);
+        juce::Slider::mouseExit(e);
+    }
     void mouseWheelMove(const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel) override
     {
         if(wheelStep <= 0.0)
@@ -83,7 +94,9 @@ public:
         const double next = juce::jlimit(getMinimum(), getMaximum(), getValue() + stepDir * wheelStep);
         setValue(next, juce::sendNotificationSync);
     }
+    std::function<void(bool)> onHoverChanged;
     void setDragSmoothing(float rate) { dragSmoothing = juce::jlimit(0.05f, 1.0f, rate); }
+    void setLinearInset(float inset) { linearInset = juce::jlimit(0.0f, 8.0f, inset); repaint(); }
     void setWheelStep(double step) { wheelStep = juce::jmax(0.0, step); }
     void setSnapStep(double step) { snapStep = step > 0.0 ? step : 0.0; }
     double wheelStep = 0.1;
@@ -280,7 +293,7 @@ private:
     }
     void drawLinear(juce::Graphics& g)
     {
-        auto b = getLocalBounds().toFloat().reduced(4.0f);
+        auto b = getLocalBounds().toFloat().reduced(linearInset);
         const float midY = b.getCentreY();
         const float h = b.getHeight();
         const float top = midY - h * 0.5f;
@@ -420,6 +433,7 @@ private:
     juce::Rectangle<int> entryBounds;
     juce::Point<float> smoothPos;
     float dragSmoothing = 0.6f;
+    float linearInset = 4.0f;
     int displayDecimals = 2;
     SmoothValue disp;
     SmoothColour discS;
