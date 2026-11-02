@@ -277,6 +277,13 @@ FluorescenceAudioProcessorEditor::FluorescenceAudioProcessorEditor(FluorescenceA
     {
         menuButtonA.setActive(false);
         proc.apvts.state.setProperty("uiSecondaryOpen", false, nullptr);
+        hoveredKnob = nullptr;
+        readoutKnob = nullptr;
+        readoutLabel = nullptr;
+        readoutMode = ReadoutMode::none;
+        ++readoutTimerToken;
+        valueReadout.hideImmediately();
+        content.addChildComponent(valueReadout);
     };
     flyoutA.onPinnedChanged = [this] (bool pinned)
     {

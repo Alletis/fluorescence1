@@ -54,6 +54,14 @@ public:
         targetAlpha = 0.0f;
         startTimerHz(60);
     }
+    void hideImmediately()
+    {
+        stopTimer();
+        alpha = 0.0f;
+        targetAlpha = 0.0f;
+        setVisible(false);
+        repaint();
+    }
     void paint(juce::Graphics& g) override
     {
         if(alpha <= 0.001f)
