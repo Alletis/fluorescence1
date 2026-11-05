@@ -123,10 +123,10 @@ namespace OverlayRendering
             juce::Image result(juce::Image::ARGB, width, height, true);
             juce::Graphics g(result);
             g.setImageResamplingQuality(juce::Graphics::highResamplingQuality);
-            const float offsetX = (float) (destinationCentreX + translateX
-                                           - resize * sourceCentreX);
-            const float offsetY = (float) (destinationCentreY + translateY
-                                           - resize * sourceCentreY);
+            const float offsetX = (float) (destinationCentreX + 0.5 + translateX
+                                           - resize * (sourceCentreX + 0.5));
+            const float offsetY = (float) (destinationCentreY + 0.5 + translateY
+                                           - resize * (sourceCentreY + 0.5));
             g.drawImageTransformed(
                 source, juce::AffineTransform(resize, 0.0f, offsetX,
                                               0.0f, resize, offsetY));

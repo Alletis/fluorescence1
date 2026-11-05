@@ -6,8 +6,8 @@ class SmoothToggleButton : public juce::ToggleButton,
                            private juce::Timer
 {
 public:
-    explicit SmoothToggleButton(const juce::String& text)
-        : juce::ToggleButton(text)
+    explicit SmoothToggleButton(const juce::String& text, bool magenta = false)
+        : juce::ToggleButton(text), magentaAccent(magenta)
     {
         startTimerHz(60);
     }
@@ -31,22 +31,26 @@ private:
         const bool on = getToggleState();
         const bool hov = isOver();
         const bool prs = isDown();
-        const juce::Colour fillT = on ? (prs ? juce::Colour(0xff08222b) : hov ? juce::Colour(0xff123a42) : juce::Colour(0xff15151a))
+        const auto activeFill = prs ? juce::Colour(magentaAccent ? 0xff160f18 : 0xff08222b)
+                                    : juce::Colour(magentaAccent ? 0xff281d30 : 0xff123a42);
+        const auto accent = prs ? juce::Colour(magentaAccent ? 0xffb85cc7 : 0xff307a7c)
+                          : hov ? juce::Colour(magentaAccent ? 0xffffbbff : 0xff6ecdd0)
+                                : juce::Colour(magentaAccent ? 0xffeb8fff : 0xff45aeb1);
+        const juce::Colour fillT = on ? (prs || hov ? activeFill : juce::Colour(0xff15151a))
                                        : (prs ? juce::Colour(0xff0c0c10) : juce::Colour(0xff15151a));
-        const juce::Colour lineT = on ? (prs ? juce::Colour(0xff307a7c) : hov ? juce::Colour(0xff6ecdd0) : juce::Colour(0xff45aeb1))
+        const juce::Colour lineT = on ? accent
                                        : (prs ? juce::Colour(0xff5a5a64) : hov ? juce::Colour(0xff6a6a74) : juce::Colour(0xff4a4a54));
-        const juce::Colour markT = prs ? juce::Colour(0xff307a7c) : hov ? juce::Colour(0xff6ecdd0) : juce::Colour(0xff45aeb1);
         const float onT = on ? 1.0f : 0.0f;
         const float rate = 1.0f / 3.0f;
         if(! primed)
         {
-            fillS.set(fillT); lineS.set(lineT); markS.set(markT); onAmt = onT;
+            fillS.set(fillT); lineS.set(lineT); markS.set(accent); onAmt = onT;
             primed = true; repaint(); return;
         }
         bool moving = false;
         if(fillS.approach(fillT, rate)) moving = true;
         if(lineS.approach(lineT, rate)) moving = true;
-        if(markS.approach(markT, rate)) moving = true;
+        if(markS.approach(accent, rate)) moving = true;
         const float d = onT - onAmt; onAmt += d * rate;
         if(std::abs(d) > 0.002f) moving = true;
         if(moving) repaint();
@@ -79,6 +83,7 @@ private:
                           getLocalBounds().withTrimmedLeft((int) box + 12).withTrimmedRight(2),
                           juce::Justification::centredLeft, 10);
     }
+    const bool magentaAccent;
     SmoothColour fillS, lineS, markS;
     float onAmt = 0.0f;
     bool primed = false;

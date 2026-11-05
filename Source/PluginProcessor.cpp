@@ -73,6 +73,8 @@ FluorescenceAudioProcessor::FluorescenceAudioProcessor()
         noteParam[i] = apvts.getRawParameterValue(noteIds[i]);
     fullMidiParam = apvts.getRawParameterValue("fullMidi");
     targetModeParam = apvts.getRawParameterValue("targetMode");
+    midiBendRangeParam = apvts.getRawParameterValue("midiBendRange");
+    mpeParam = apvts.getRawParameterValue("mpe");
     hysteresisParam = apvts.getRawParameterValue("hysteresis");
 }
 FluorescenceAudioProcessor::~FluorescenceAudioProcessor()
@@ -171,6 +173,12 @@ FluorescenceAudioProcessor::createLayout()
             juce::String("Note ") + noteNames[i], false));
     params.push_back(std::make_unique<juce::AudioParameterBool>(
         juce::ParameterID { "hysteresis", 1 }, "Hysteresis", false));
+    params.push_back(std::make_unique<juce::AudioParameterInt>(
+        juce::ParameterID { "midiBendRange", 1 }, "Pitch Bend Range", 0, 96, 0,
+        juce::AudioParameterIntAttributes().withStringFromValueFunction(
+            [] (int range, int) { return range == 0 ? juce::String("Auto") : juce::String(range); })));
+    params.push_back(std::make_unique<juce::AudioParameterBool>(
+        juce::ParameterID { "mpe", 1 }, "MPE", false));
     return { params.begin(), params.end() };
 }
 const juce::String FluorescenceAudioProcessor::getName() const { return "Fluorescence"; }
@@ -191,6 +199,7 @@ const juce::String FluorescenceAudioProcessor::getProgramName(int) { return {}; 
 void FluorescenceAudioProcessor::changeProgramName(int, const juce::String&) {}
 void FluorescenceAudioProcessor::prepareToPlay(double sr, int)
 {
+    resetTargetMidi();
     sampleRate = sr;
     window.assign(maxFftSize, 0.0f);
     fftData.assign(2 * maxFftSize, 0.0f);
@@ -860,18 +869,21 @@ float FluorescenceAudioProcessor::nearestTargetMidi(float baseHz) const
         }
         return best;
     }
-    const bool midiOn = (mode == 1);
-    const bool fullMidiOn = midiOn && (fullMidiParam != nullptr && fullMidiParam->load() >= 0.5f);
-    if(fullMidiOn)
+    if(mode == 1)
     {
-        int bestNote = -1; float bestDist = 1.0e9f;
-        for(int n = 0; n < 128; ++n)
+        if(midiTargetCount == 0) return -1000.0f;
+        const auto first = midiTargets.begin();
+        const auto end = first + midiTargetCount;
+        const float octave = fullMidiTargets ? 0.0f : 12.0f * std::floor(midi / 12.0f);
+        const auto upper = std::lower_bound(first, end, midi - octave);
+        if(fullMidiTargets)
         {
-            if(midiHeldNote[n] <= 0) continue;
-            const float d = std::abs((float) n - midi);
-            if(d < bestDist) { bestDist = d; bestNote = n; }
+            if(upper == first) return *first;
+            if(upper == end) return *(end - 1);
         }
-        return(bestNote < 0) ? -1000.0f : (float) bestNote;
+        const float below = octave + (upper == first ? *(end - 1) - 12.0f : *(upper - 1));
+        const float above = octave + (upper == end ? *first + 12.0f : *upper);
+        return midi - below <= above - midi ? below : above;
     }
     bool any = false;
     for(int i = 0; i < 12; ++i) any = any || scaleOn[i];
@@ -3387,6 +3399,90 @@ void FluorescenceAudioProcessor::resetProcessingStateForStereoModeSwitch()
     numPeaks = 0;
     numBases = 0;
 }
+void FluorescenceAudioProcessor::resetTargetMidi()
+{
+    midiChannels = {};
+    midiTargetCount = 0;
+    midiTargetsDirty = true;
+    midiScaleMask.store(0);
+}
+void FluorescenceAudioProcessor::handleTargetMidi(const juce::MidiMessage& message)
+{
+    const int channel = message.getChannel();
+    if(channel == 0) return;
+    auto& state = midiChannels[(size_t) (channel - 1)];
+    if(message.isNoteOn())
+    {
+        auto& heldCount = state.held[(size_t) message.getNoteNumber()];
+        if(heldCount < 127) ++heldCount;
+    }
+    else if(message.isNoteOff())
+    {
+        auto& heldCount = state.held[(size_t) message.getNoteNumber()];
+        if(heldCount > 0) --heldCount;
+    }
+    else if(message.isPitchWheel())
+    {
+        state.wheel = message.getPitchWheelValue();
+    }
+    else if(message.isAllNotesOff() || message.isAllSoundOff())
+    {
+        state.held.fill(0);
+        if(channel == 1 && mpeParam->load() >= 0.5f)
+            for(auto& member : midiChannels) member.held.fill(0);
+    }
+    else if(message.isControllerOfType(121))
+    {
+        state.wheel = 8192;
+    }
+    else
+    {
+        return;
+    }
+    midiTargetsDirty = true;
+}
+void FluorescenceAudioProcessor::updateMidiTargets()
+{
+    const bool full = fullMidiParam->load() >= 0.5f;
+    const bool mpe = mpeParam->load() >= 0.5f;
+    const int range = (int) midiBendRangeParam->load();
+    if(! midiTargetsDirty && full == fullMidiTargets && mpe == mpeTargets && range == midiBendRange)
+        return;
+    fullMidiTargets = full;
+    mpeTargets = mpe;
+    midiBendRange = range;
+    midiTargetsDirty = false;
+    midiTargetCount = 0;
+    int canonicalMask = 0;
+    const auto bend = [] (int wheel, int semitones)
+    {
+        const int delta = wheel - 8192;
+        return(float) delta * (float) semitones / (delta > 0 ? 8191.0f : 8192.0f);
+    };
+    const int wheelRange = range != 0 ? range : 2;
+    const float globalBend = mpe ? bend(midiChannels.front().wheel, wheelRange) : 0.0f;
+    constexpr int mpeNoteRange = 48;
+    for(size_t channel = 0; channel < midiChannels.size(); ++channel)
+    {
+        const auto& state = midiChannels[channel];
+        const float noteExpression = mpe && channel != 0 ? bend(state.wheel, mpeNoteRange) : 0.0f;
+        const float pitchBend = mpe ? globalBend : bend(state.wheel, wheelRange);
+        const float offset = pitchBend + noteExpression;
+        for(size_t note = 0; note < state.held.size(); ++note)
+        {
+            if(state.held[note] == 0) continue;
+            canonicalMask |= 1 << (note % 12);
+            float target = (float) note + offset;
+            if(! full)
+                target -= 12.0f * std::floor(target / 12.0f);
+            midiTargets[midiTargetCount++] = target;
+        }
+    }
+    const auto end = midiTargets.begin() + midiTargetCount;
+    std::sort(midiTargets.begin(), end);
+    midiTargetCount = (size_t) (std::unique(midiTargets.begin(), end) - midiTargets.begin());
+    midiScaleMask.store(canonicalMask);
+}
 void FluorescenceAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
                                              juce::MidiBuffer& midiMessages)
 {
@@ -3394,47 +3490,21 @@ void FluorescenceAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     if(fftEngines.empty() || window.empty())
         return;
     const int targetMode = (targetModeParam != nullptr) ? juce::roundToInt(targetModeParam->load()) : 0;
-    if(targetMode == 1)
+    const bool midiActive = targetMode == 1;
+    if(! midiActive && midiWasActive)
+        resetTargetMidi();
+    midiWasActive = midiActive;
+    auto midiEvent = midiMessages.begin();
+    const auto midiEnd = midiMessages.end();
+    const auto consumeMidiThrough = [&] (int sample)
     {
-        for(const auto meta : midiMessages)
+        while(midiEvent != midiEnd && (*midiEvent).samplePosition <= sample)
         {
-            const auto m = meta.getMessage();
-            if(m.isNoteOn())
-            {
-                const int nn = juce::jlimit(0, 127, m.getNoteNumber());
-                const int pc = nn % 12;
-                midiHeldNote[nn] = juce::jmin(127, midiHeldNote[nn] + 1);
-                midiHeld[pc] = juce::jmin(127, midiHeld[pc] + 1);
-            }
-            else if(m.isNoteOff())
-            {
-                const int nn = juce::jlimit(0, 127, m.getNoteNumber());
-                const int pc = nn % 12;
-                midiHeldNote[nn] = juce::jmax(0, midiHeldNote[nn] - 1);
-                midiHeld[pc] = juce::jmax(0, midiHeld[pc] - 1);
-            }
-            else if(m.isAllNotesOff() || m.isAllSoundOff())
-            {
-                for(int n = 0; n < 128; ++n) midiHeldNote[n] = 0;
-                for(int i = 0; i < 12; ++i) midiHeld[i] = 0;
-            }
+            handleTargetMidi((*midiEvent).getMessage());
+            ++midiEvent;
         }
-        int mask = 0;
-        for(int i = 0; i < 12; ++i)
-            if(midiHeld[i] > 0) mask |= (1 << i);
-        if(mask != lastMidiMask)
-        {
-            lastMidiMask = mask;
-            midiScaleMask.store(mask);
-        }
-    }
-    else if(lastMidiMask != -1)
-    {
-        for(int n = 0; n < 128; ++n) midiHeldNote[n] = 0;
-        for(int i = 0; i < 12; ++i) midiHeld[i] = 0;
-        lastMidiMask = -1;
-        midiScaleMask.store(0);
-    }
+        updateMidiTargets();
+    };
     reconfigure(minOrder + (int) sizeParam->load(),
                  overlapFromIndex((int) overlapParam->load()));
     const bool visualsActive = hasVisualEditor();
@@ -3547,6 +3617,7 @@ void FluorescenceAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
                 else
                     scDetector.publishGatedFrame(pvBypassed);
             }
+            if(midiActive) consumeMidiThrough(s);
             updateDetectionFrameParams();
             for(int ch = 0; ch < numCh; ++ch)
                 processFrame(ch);
@@ -3554,6 +3625,7 @@ void FluorescenceAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
                 publishSpectrum(numCh);
         }
     }
+    if(midiActive) consumeMidiThrough(numSamples);
 }
 bool FluorescenceAudioProcessor::hasEditor() const { return true; }
 juce::AudioProcessorEditor* FluorescenceAudioProcessor::createEditor()

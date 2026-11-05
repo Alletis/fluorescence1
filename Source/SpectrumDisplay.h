@@ -6,14 +6,10 @@
 #include "KnobLookAndFeel.h"
 #include "OverlayAssets.h"
 #include "OverlayRendering.h"
-#if ALLETIS_FLUORESCENCE_EXPERIMENTAL_OPENGL_UI
- #include "GpuOverlayBackground.h"
-#endif
 #include <cmath>
 #include <cstdlib>
 #include <array>
 #include <atomic>
-#include <optional>
 class SpectrumDisplay : public juce::Component,
                         private juce::Timer
 {
@@ -58,7 +54,6 @@ public:
     {
         overlayCover = {};
         overlayCoverSource = {};
-        overlayTransformCacheValid = false;
         repaint();
     }
     void setDisableUiEnabled(bool enabled)
@@ -78,35 +73,16 @@ public:
         plotClip.addRoundedRectangle(plot, spectrumCornerRadius);
         g.setColour(juce::Colour(0xff0a0a0c));
         g.fillRoundedRectangle(plot, spectrumCornerRadius);
-       #if ALLETIS_FLUORESCENCE_EXPERIMENTAL_OPENGL_UI
-        const bool useGpuOverlay = juce::OpenGLContext::getCurrentContext() != nullptr;
-       #else
-        constexpr bool useGpuOverlay = false;
-       #endif
-        if(overlayAssets != nullptr && overlayDisplaySource == nullptr)
-            overlayAssets->noteStartupFrame(FluorescenceOverlayAssets::Slot::spectrum);
-        auto overlay = overlayAssets != nullptr
-            ? (useGpuOverlay || overlayDisplaySource != nullptr
-                ? overlayAssets->getSnapshot(FluorescenceOverlayAssets::Slot::spectrum)
-                : overlayDisplaySource == nullptr
-                ? overlayAssets->getSnapshot(
-                    FluorescenceOverlayAssets::Slot::spectrum,
-                    juce::jmax(1, juce::roundToInt(W)),
-                    juce::jmax(1, juce::roundToInt(H)))
-                : overlayAssets->getSnapshot(FluorescenceOverlayAssets::Slot::spectrum))
-            : FluorescenceOverlayAssets::Snapshot{};
-        if(overlayDisplaySource != nullptr && !useGpuOverlay)
+        bool useOverlay = false;
+        if(overlayAssets != nullptr)
         {
-            overlay.blurredImage = overlayDisplaySource->overlayCover;
-            overlay.previousBlurredImage = overlayDisplaySource->previousOverlayCover;
-            overlay.validImage = overlay.blurredImage.isValid();
+            if(overlayDisplaySource == nullptr)
+                overlayAssets->noteStartupFrame(FluorescenceOverlayAssets::Slot::spectrum);
+            const auto overlay = overlayAssets->getSnapshot(FluorescenceOverlayAssets::Slot::spectrum);
+            if(overlay.settings.enabled && overlay.validImage
+               && overlay.settings.brightness * overlay.loadMultiplier > 0.0001f)
+                useOverlay = paintSpectrumUnion(g, plot, overlay);
         }
-        const float overlayBrightness = overlay.settings.brightness * overlay.loadMultiplier;
-        const bool useOverlay = overlay.settings.enabled && overlay.validImage &&
-                                overlayBrightness > 0.0001f;
-        if(useOverlay)
-            paintSpectrumUnion(g, plot, overlay,
-                               overlayDisplaySource != nullptr && !useGpuOverlay);
         {
             juce::Graphics::ScopedSaveState ss(g);
             g.reduceClipRegion(plotClip);
@@ -689,93 +665,52 @@ private:
                        pixelWidth, plot.getHeight());
         }
     }
-    void paintSpectrumUnion(juce::Graphics& g, juce::Rectangle<float> plot,
-                            const FluorescenceOverlayAssets::Snapshot& overlay,
-                            bool sourceIsDisplayedImage)
+    const juce::Image& getOverlayReferenceCover(const FluorescenceOverlayAssets::Snapshot& overlay)
+    {
+        const auto plot = getPlotBounds();
+        const juce::Point<int> size { juce::jmax(1, juce::roundToInt(plot.getWidth())),
+                                      juce::jmax(1, juce::roundToInt(plot.getHeight())) };
+        if(referenceCoverSource != overlay.blurredImage || referenceCoverSize != size
+           || referenceCoverBlur != overlay.settings.blur)
+        {
+            referenceCoverSource = overlay.blurredImage;
+            referenceCoverSize = size;
+            referenceCoverBlur = overlay.settings.blur;
+            referenceCover = FluorescenceOverlayAssets::renderBlurredCover(
+                referenceCoverSource, size.x, size.y, referenceCoverBlur);
+        }
+        return referenceCover;
+    }
+    bool paintSpectrumUnion(juce::Graphics& g, juce::Rectangle<float> plot,
+                            const FluorescenceOverlayAssets::Snapshot& overlay)
     {
         const int w = juce::jmax(1, juce::roundToInt(plot.getWidth()));
         const int h = juce::jmax(1, juce::roundToInt(plot.getHeight()));
-        const auto boundMode = overlay.settings.boundMode;
-       #if ALLETIS_FLUORESCENCE_EXPERIMENTAL_OPENGL_UI
-        if(!sourceIsDisplayedImage)
+        auto& reference = overlayDisplaySource != nullptr ? *overlayDisplaySource : *this;
+        const auto& cover = reference.getOverlayReferenceCover(overlay);
+        const auto& settings = overlay.settings;
+        if(overlayCoverSource != cover || overlayCover.getWidth() != w
+           || overlayCover.getHeight() != h || overlayCachedResize != settings.resize
+           || overlayCachedTranslateX != settings.translateX
+           || overlayCachedTranslateY != settings.translateY
+           || overlayCachedBoundMode != settings.boundMode)
         {
-            juce::Graphics::ScopedSaveState saved(g);
-            juce::Path clip;
-            clip.addRoundedRectangle(plot, spectrumCornerRadius);
-            g.reduceClipRegion(clip);
-            const auto* topLevel = getTopLevelComponent();
-            const auto targetPlot = topLevel != nullptr
-                ? topLevel->getLocalArea(this, plot.toNearestInt()).toFloat()
-                : plot;
-            const auto targetBounds = topLevel != nullptr
-                ? topLevel->getLocalBounds() : getLocalBounds();
-            const juce::Point<float> targetSize {
-                (float)targetBounds.getWidth(), (float)targetBounds.getHeight()
-            };
-            if(gpuOverlay.paint(g, plot, targetPlot, targetSize,
-                                overlay, heatImage))
-                return;
+            overlayCoverSource = cover;
+            overlayCover = OverlayRendering::transformImage(
+                cover, w, h, settings.resize, settings.translateX, settings.translateY,
+                settings.boundMode);
+            overlayCachedResize = settings.resize;
+            overlayCachedTranslateX = settings.translateX;
+            overlayCachedTranslateY = settings.translateY;
+            overlayCachedBoundMode = settings.boundMode;
         }
-       #endif
-        const bool transformChanged = ! overlayTransformCacheValid
-            || overlayCoverSource != overlay.blurredImage
-            || previousOverlayCoverSource != overlay.previousBlurredImage
-            || overlayCover.getWidth() != w || overlayCover.getHeight() != h
-            || overlayCachedResize != overlay.settings.resize
-            || overlayCachedTranslateX != overlay.settings.translateX
-            || overlayCachedTranslateY != overlay.settings.translateY
-            || overlayCachedBlur != overlay.settings.blur
-            || overlayCachedBoundMode != (int) boundMode;
-        if(transformChanged)
-        {
-            overlayCoverSource = overlay.blurredImage;
-            previousOverlayCoverSource = overlay.previousBlurredImage;
-            if(sourceIsDisplayedImage)
-            {
-                const auto fitDisplayedImage = [w, h] (const juce::Image& source)
-                {
-                    if(! source.isValid()) return juce::Image{};
-                    juce::Image fitted(juce::Image::ARGB, w, h, true);
-                    juce::Graphics fittedGraphics(fitted);
-                    fittedGraphics.setImageResamplingQuality(
-                        juce::Graphics::highResamplingQuality);
-                    fittedGraphics.drawImage(
-                        source, fitted.getBounds().toFloat(),
-                        juce::RectanglePlacement(
-                            juce::RectanglePlacement::fillDestination
-                            | juce::RectanglePlacement::centred));
-                    return fitted;
-                };
-                overlayCover = fitDisplayedImage(overlay.blurredImage);
-                previousOverlayCover = fitDisplayedImage(overlay.previousBlurredImage);
-            }
-            else
-            {
-                const auto liveBlurredCover =
-                    FluorescenceOverlayAssets::renderBlurredCover(
-                        overlay.blurredImage, w, h, overlay.settings.blur);
-                overlayCover = OverlayRendering::transformImage(
-                    liveBlurredCover, w, h, overlay.settings.resize,
-                    overlay.settings.translateX, overlay.settings.translateY, boundMode);
-                previousOverlayCover = {};
-            }
-            overlayCachedResize = overlay.settings.resize;
-            overlayCachedTranslateX = overlay.settings.translateX;
-            overlayCachedTranslateY = overlay.settings.translateY;
-            overlayCachedBlur = overlay.settings.blur;
-            overlayCachedBoundMode = (int) boundMode;
-            overlayTransformCacheValid = true;
-        }
-        if(! overlayCover.isValid()) return;
+        if(! overlayCover.isValid()) return false;
         const float brightness = juce::jlimit(
             0.0f, 1.0f, overlay.settings.brightness * overlay.loadMultiplier);
         if(! overlayMergedImage.isValid()
            || overlayMergedImage.getWidth() != w || overlayMergedImage.getHeight() != h)
             overlayMergedImage = juce::Image(juce::Image::RGB, w, h, false);
         juce::Image::BitmapData image(overlayCover, juce::Image::BitmapData::readOnly);
-        std::optional<juce::Image::BitmapData> previousImage;
-        if(previousOverlayCover.isValid())
-            previousImage.emplace(previousOverlayCover, juce::Image::BitmapData::readOnly);
         juce::Image::BitmapData dest(overlayMergedImage, juce::Image::BitmapData::writeOnly);
         juce::Image::BitmapData heat(heatImage, juce::Image::BitmapData::readOnly);
         for(int x = 0; x < w; ++x)
@@ -785,10 +720,7 @@ private:
             const float heatStrength = heat.getPixelColour(hx, 0).getFloatRed();
             for(int y = 0; y < h; ++y)
             {
-                auto pixel = image.getPixelColour(x, y);
-                if(previousImage.has_value() && overlay.blurTransition < 0.9999f)
-                    pixel = previousImage->getPixelColour(x, y).interpolatedWith(
-                        pixel, overlay.blurTransition);
+                const auto pixel = image.getPixelColour(x, y);
                 const float f = brightness * pixel.getFloatAlpha();
                 const float frequencyLight = heatStrength * 0.54f;
                 dest.setPixelColour(x, y, juce::Colour(
@@ -803,6 +735,7 @@ private:
         g.reduceClipRegion(clip);
         g.drawImageAt(overlayMergedImage,
                   juce::roundToInt(plot.getX()), juce::roundToInt(plot.getY()));
+        return true;
     }
     void rebuildImage()
     {
@@ -1447,16 +1380,13 @@ private:
     FluorescenceOverlayAssets* overlayAssets = nullptr;
     SpectrumDisplay* overlayDisplaySource = nullptr;
     juce::Image overlayCover, overlayCoverSource, overlayMergedImage;
-    juce::Image previousOverlayCover, previousOverlayCoverSource;
-    bool overlayTransformCacheValid = false;
+    juce::Image referenceCover, referenceCoverSource;
+    juce::Point<int> referenceCoverSize;
+    float referenceCoverBlur = -1.0f;
     float overlayCachedResize = -1.0f;
     float overlayCachedTranslateX = 0.0f;
     float overlayCachedTranslateY = 0.0f;
-    float overlayCachedBlur = -1.0f;
-    int overlayCachedBoundMode = -1;
-#if ALLETIS_FLUORESCENCE_EXPERIMENTAL_OPENGL_UI
-    FluorescenceGpuSpectrumOverlay gpuOverlay;
-#endif
+    OverlayRendering::BoundMode overlayCachedBoundMode = OverlayRendering::BoundMode::clamp;
     Snapshot snapshot;
     float fMax = 20000.0f;
     bool dragging = false;

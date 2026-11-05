@@ -453,9 +453,24 @@ private:
     std::atomic<float>* fullMidiParam = nullptr;
     std::atomic<float>* targetModeParam = nullptr;
     std::atomic<float>* hysteresisParam = nullptr;
-    int midiHeld[12] = { 0 };
-    int midiHeldNote[128] = { 0 };
-    int lastMidiMask = -1;
+    struct MidiChannelState
+    {
+        std::array<juce::uint8, 128> held {};
+        int wheel = 8192;
+    };
+    std::array<MidiChannelState, 16> midiChannels {};
+    std::array<float, 16 * 128> midiTargets {};
+    std::size_t midiTargetCount = 0;
+    bool midiTargetsDirty = true;
+    bool midiWasActive = false;
+    bool fullMidiTargets = false;
+    bool mpeTargets = false;
+    int midiBendRange = 0;
+    std::atomic<float>* midiBendRangeParam = nullptr;
+    std::atomic<float>* mpeParam = nullptr;
+    void handleTargetMidi(const juce::MidiMessage&);
+    void updateMidiTargets();
+    void resetTargetMidi();
     std::atomic<int> midiScaleMask { 0 };
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(FluorescenceAudioProcessor)
     void handleAsyncUpdate() override;

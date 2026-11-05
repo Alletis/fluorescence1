@@ -6,6 +6,7 @@
 #include "SmoothTextButton.h"
 #include "ScaleStepperButton.h"
 #include "KeyButton.h"
+#include "SmoothToggle.h"
 class ScalePanel : public juce::Component,
                    private juce::Timer
 {
@@ -16,22 +17,68 @@ public:
         for(int i = 0; i < 12; ++i)
             note[i] = apvts.getParameter("note" + juce::String(i));
         midiParam = apvts.getParameter("targetMode");
+        addAndMakeVisible(scaleControls);
+        addAndMakeVisible(midiControls);
         rootBtn.setMagentaAccent(true);
         scaleBtn.setMagentaAccent(true);
         fillClearBtn.setMagentaAccent(true);
         rootBtn.setIndex(0);
         rootBtn.onValueChange = [this] (int) { onKeyChanged(); };
         rootBtn.onMenuRequest = [this] { showKeyMenu(); };
-        addAndMakeVisible(rootBtn);
+        scaleControls.addAndMakeVisible(rootBtn);
         scaleBtn.setButtonText("Scale...");
         scaleBtn.onClick = [this] { showScaleMenu(); };
         scaleBtn.onStep = [this] (int direction) { stepScale(direction); };
-        addAndMakeVisible(scaleBtn);
+        scaleControls.addAndMakeVisible(scaleBtn);
         fillClearBtn.onClick = [this] { fillOrClear(); };
-        addAndMakeVisible(fillClearBtn);
-        styleLabel(rootLbl, "KEY");
-        styleLabel(scaleLbl, "SCALE");
+        scaleControls.addAndMakeVisible(fillClearBtn);
+        styleLabel(scaleControls, rootLbl, "KEY");
+        styleLabel(scaleControls, scaleLbl, "SCALE");
+        styleLabel(midiControls, bendLbl, "BEND RANGE");
+        bendBtn.setComponentID("midiBendRange");
+        bendBtn.setMagentaAccent(true);
+        bendBtn.formatValue = [] (int range) { return range == 0 ? juce::String("Auto")
+                                                                : juce::String(range) + " st"; };
+        midiControls.addAndMakeVisible(bendBtn);
+        midiControls.addAndMakeVisible(fullMidiBtn);
+        midiControls.addAndMakeVisible(mpeBtn);
+        bendBtn.addChildComponent(bendEditor);
+        bendEditor.setJustificationType(juce::Justification::centred);
+        bendEditor.setFont(KnobLookAndFeel::courier(KnobLookAndFeel::uiFont));
+        bendEditor.setColour(juce::TextEditor::backgroundColourId, juce::Colour(0xff281d30));
+        bendEditor.setColour(juce::TextEditor::textColourId, juce::Colour(0xffffd5ff));
+        bendEditor.setColour(juce::TextEditor::focusedOutlineColourId, juce::Colour(0xffeb8fff));
+        bendEditor.setColour(juce::TextEditor::highlightColourId, juce::Colour(0xff562b58));
+        bendBtn.onMenuRequest = [this]
+        {
+            const int range = bendBtn.getIndex();
+            bendEditor.setText(range == 0 ? juce::String("Auto") : juce::String(range),
+                               juce::dontSendNotification);
+            bendEditor.setVisible(true);
+            bendEditor.showEditor();
+        };
+        bendEditor.onEditorHide = [this] { bendEditor.setVisible(false); };
+        bendEditor.onTextChange = [this]
+        {
+            const auto text = bendEditor.getText().trim();
+            if(text.equalsIgnoreCase("Auto"))
+                bendBtn.setIndex(0, true);
+            else if(text.isNotEmpty() && text.containsOnly("0123456789"))
+                bendBtn.setIndex(text.substring(0, 3).getIntValue(), true);
+        };
+        bendAttachment = std::make_unique<juce::ParameterAttachment>(
+            *apvts.getParameter("midiBendRange"),
+            [this] (float range) { bendBtn.setIndex((int) range); });
+        bendBtn.onValueChange = [this] (int range)
+        {
+            bendAttachment->setValueAsCompleteGesture((float) range);
+        };
+        bendAttachment->sendInitialUpdate();
+        fullMidiAttachment = std::make_unique<ButtonAttachment>(apvts, "fullMidi", fullMidiBtn);
+        mpeAttachment = std::make_unique<ButtonAttachment>(apvts, "mpe", mpeBtn);
         restoreUiState();
+        targetControlsPhase = midiOn() ? 1.0f : -1.0f;
+        updateTargetControls();
         startTimerHz(30);
     }
     ~ScalePanel() override { stopTimer(); }
@@ -47,6 +94,8 @@ public:
     }
     void resized() override
     {
+        scaleControls.setBounds(getLocalBounds());
+        midiControls.setBounds(getLocalBounds());
         auto r = getLocalBounds();
         const int labelH = 13, rowH = 24, gap = 4;
         rootLbl.setBounds(r.removeFromTop(labelH));
@@ -56,6 +105,11 @@ public:
         scaleBtn.setBounds(r.removeFromTop(rowH));
         r.removeFromTop(gap + 2);
         fillClearBtn.setBounds(r.removeFromTop(rowH));
+        bendLbl.setBounds(rootLbl.getBounds());
+        bendBtn.setBounds(rootBtn.getBounds());
+        bendEditor.setBounds(bendBtn.valueBounds().reduced(1));
+        fullMidiBtn.setBounds(scaleBtn.getBounds());
+        mpeBtn.setBounds(fillClearBtn.getBounds());
     }
 private:
     struct MagentaPopupLookAndFeel : KnobLookAndFeel
@@ -105,14 +159,14 @@ private:
                 }
             });
     }
-    void styleLabel(juce::Label& l, const juce::String& t)
+    void styleLabel(juce::Component& parent, juce::Label& l, const juce::String& t)
     {
         l.setText(t, juce::dontSendNotification);
         l.setJustificationType(juce::Justification::centredLeft);
         l.setColour(juce::Label::textColourId, juce::Colour(0xffb0b0b8));
         l.setFont(KnobLookAndFeel::courier(KnobLookAndFeel::uiFont));
         l.setInterceptsMouseClicks(false, false);
-        addAndMakeVisible(l);
+        parent.addAndMakeVisible(l);
     }
     bool midiOn() const { return midiParam != nullptr
                               && juce::roundToInt(midiParam->getValue() * 2.0f) == 1; }
@@ -233,9 +287,7 @@ private:
     void timerCallback() override
     {
         const bool enabled = ! midiOn();
-        rootBtn.setEnabled(enabled);
-        scaleBtn.setEnabled(enabled);
-        fillClearBtn.setEnabled(enabled);
+        updateTargetControls();
         fillClearBtn.setButtonText(anyNoteOn() ? "CLEAR" : "FULL");
         if(enabled && presetScaleSelected)
         {
@@ -247,10 +299,42 @@ private:
             lastSeenMask = nowMask;
         }
     }
+    void updateTargetControls()
+    {
+        const bool showMidi = midiOn();
+        if(! showMidi && bendEditor.isBeingEdited())
+            bendEditor.hideEditor(false);
+        constexpr float step = 0.2f;
+        if(showMidi)
+            targetControlsPhase = juce::jmin(1.0f, targetControlsPhase + step);
+        else
+            targetControlsPhase = juce::jmax(-1.0f, targetControlsPhase - step);
+        if(std::abs(targetControlsPhase) < 0.001f)
+            targetControlsPhase = 0.0f;
+        const auto apply = [] (juce::Component& group, float alpha, bool selected)
+        {
+            const bool visible = alpha > 0.0f;
+            group.setAlpha(alpha);
+            group.setVisible(visible);
+            group.setInterceptsMouseClicks(false, visible && selected);
+            group.setEnabled(visible && selected);
+        };
+        apply(scaleControls, juce::jmax(0.0f, -targetControlsPhase), ! showMidi);
+        apply(midiControls, juce::jmax(0.0f, targetControlsPhase), showMidi);
+    }
+    using ButtonAttachment = juce::AudioProcessorValueTreeState::ButtonAttachment;
     juce::AudioProcessorValueTreeState& apvts;
     juce::RangedAudioParameter* note[12] { };
     juce::RangedAudioParameter* midiParam = nullptr;
+    juce::Component scaleControls, midiControls;
     KeyButton rootBtn;
+    KeyButton bendBtn { 96, false };
+    juce::Label bendLbl, bendEditor;
+    SmoothToggleButton fullMidiBtn { "FULL MIDI", true };
+    SmoothToggleButton mpeBtn { "MPE", true };
+    std::unique_ptr<juce::ParameterAttachment> bendAttachment;
+    std::unique_ptr<ButtonAttachment> fullMidiAttachment, mpeAttachment;
+    float targetControlsPhase = -1.0f;
     ScaleStepperButton scaleBtn;
     SmoothTextButton fillClearBtn;
     juce::Label rootLbl, scaleLbl;

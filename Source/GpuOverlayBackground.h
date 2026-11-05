@@ -324,7 +324,7 @@ public:
     {
     }
     bool paint(juce::Graphics& g, juce::Rectangle<float> plot,
-               juce::Rectangle<float> targetPlot, juce::Point<float> targetSize,
+               juce::Rectangle<float> physicalPlot,
                const FluorescenceOverlayAssets::Snapshot& source,
                const juce::Image& heatStrip)
     {
@@ -385,18 +385,12 @@ public:
             bindTexture(*activeContext, 4, resources.heat.getTextureID());
             uniform(program, "overlayTexture", 3);
             uniform(program, "heatTexture", 4);
-                uniform(program, "plotSize", (float)plotW, (float)plotH);
-                uniform(program, "targetPlot", targetPlot);
-                uniform(program, "targetLogicalSize", targetSize.x, targetSize.y);
+            uniform(program, "plotSize", (float)plotW, (float)plotH);
+            uniform(program, "physicalPlot", physicalPlot);
             uniform(program, "coverSize", (float)coverW, (float)coverH);
             uniform(program, "overlayParams", resize, source.settings.translateX,
                     source.settings.translateY, brightness);
             uniform(program, "boundMode", boundMode);
-                GLint viewport[4] {};
-                juce::gl::glGetIntegerv(juce::gl::GL_VIEWPORT, viewport);
-                uniform(program, "targetPhysicalSize",
-                    (float)juce::jmax(1, viewport[2]),
-                    (float)juce::jmax(1, viewport[3]));
             activeContext->extensions.glActiveTexture((GLenum)oldUnit);
         };
         if(compositeShader->checkCompilation(g.getInternalContext()).failed())
@@ -549,8 +543,9 @@ private:
     )GLSL";
     static constexpr const char* compositeCode = R"GLSL(
         uniform sampler2D overlayTexture, heatTexture;
-        uniform vec4 targetPlot, overlayParams;
-        uniform vec2 plotSize, coverSize, targetLogicalSize, targetPhysicalSize;
+        uniform vec4 physicalPlot, overlayParams;
+        uniform vec4 screenBounds;
+        uniform vec2 plotSize, coverSize;
         uniform int boundMode;
         float mapCoord(float value, float length)
         {
@@ -578,8 +573,8 @@ private:
         }
         void main()
         {
-            vec2 targetPoint = pixelPos * targetLogicalSize / targetPhysicalSize;
-            vec2 local = (targetPoint - targetPlot.xy) * plotSize / targetPlot.zw;
+            vec2 targetPoint = pixelPos + screenBounds.xy;
+            vec2 local = (targetPoint - physicalPlot.xy) * plotSize / physicalPlot.zw;
             float x = clamp((local.x + 0.5) / plotSize.x, 0.0, 1.0);
             vec3 overlay = sampleOverlay(local) * overlayParams.w;
             float heat = texture2D(heatTexture, vec2(x, 0.5)).r * 0.54;

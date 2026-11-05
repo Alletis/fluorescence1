@@ -120,14 +120,12 @@ FluorescenceAudioProcessorEditor::FluorescenceAudioProcessorEditor(FluorescenceA
     content.addAndMakeVisible(overlapBox);
     fftAtt = std::make_unique<CA> (p.apvts, "fftSize", fftSizeBox);
     overlapAtt = std::make_unique<CA> (p.apvts, "overlap", overlapBox);
-    content.addAndMakeVisible(fullMidiBtn);
     content.addAndMakeVisible(moreBasesBtn);
     content.addAndMakeVisible(hysteresisBtn);
     content.addAndMakeVisible(midSideBtn);
     modeBox.addItemList({ "Scale", "MIDI", "Sidechain" }, 1);
     modeBox.setWrapAround(true);
     content.addAndMakeVisible(modeBox);
-    fullMidiAtt = std::make_unique<BA> (p.apvts, "fullMidi", fullMidiBtn);
     moreBasesAtt = std::make_unique<BA> (p.apvts, "moreBases", moreBasesBtn);
     hysteresisAtt = std::make_unique<BA> (p.apvts, "hysteresis", hysteresisBtn);
     midSideAtt = std::make_unique<BA> (p.apvts, "midSide", midSideBtn);
@@ -234,7 +232,6 @@ FluorescenceAudioProcessorEditor::FluorescenceAudioProcessorEditor(FluorescenceA
     flyoutA.addAndMakeVisible(feedbackLbl);
     flyoutA.addAndMakeVisible(overlapLbl);
     flyoutA.addAndMakeVisible(overlapBox);
-    flyoutA.addAndMakeVisible(fullMidiBtn);
     flyoutA.addAndMakeVisible(moreBasesBtn);
     flyoutA.addAndMakeVisible(hysteresisBtn);
     flyoutA.addAndMakeVisible(formantLbl);
@@ -1086,23 +1083,29 @@ juce::String FluorescenceAudioProcessorEditor::findHoverHintTextForComponent(juc
     {
         if(isInsideScalePanel(c))
         {
+            if(c->getComponentID() == "midiBendRange")
+                return "Pitch Bend Range\n\nClick to type a semitone range or Auto. Drag or use the arrows to step. Auto uses 2 semitones for ordinary pitch bend. MPE note curves use a separate 48-semitone range.";
             if(dynamic_cast<KeyButton*> (c) != nullptr)
                 return "Scale Key\n\nSelect the root key for the scales.\nChanges automatically shift the scale while a preset is active.";
             if(auto* btn = dynamic_cast<juce::Button*> (c))
             {
                 const auto t = btn->getButtonText().trim().toUpperCase();
+                if(t == "FULL MIDI")
+                    return "Full MIDI\n\nTargets only one exact MIDI pitch. When off, the target repeats across octaves.";
+                if(t == "MPE")
+                    return "MPE\n\nFollows the pitch curve of each note and adds ordinary pitch bend. \nIn some DAWs, enable MPE Mode in the VST3 headers.";
                 if(t == "FULL" || t == "CLEAR")
                     return "Scale Full/Clear\n\nQuickly selects or removes all notes.";
                 return "Scale Selector\n\nSelect any scale or chord preset from the drop-down menu to the current set key.\nAny modification to the Piano Roll disables the current chosen preset.";
             }
-            break;
+            if(c == &scalePanel) break;
+            continue;
         }
         if(c == &menuButtonA) return "More Options\n\nClick here to show or hide additional options.";
         if(c == &bypassModeBtn) return "Active/Bypass\n\nBypass disables all Phase-Vocoder processing, passing the dry signal through for comparison.";
         if(c == &fftSizeBox) return "FFT Size\n\nLarger sizes give higher frequency resolution and better low-end accuracy but lower time resolution and more latency.";
         if(c == &overlapBox) return "FFT Overlap\n\nHigher overlap improves time resolution and reduces artefacts at the cost of more CPU.";
         if(c == &modeBox) return "Targets\n\nSelect source type for attraction targets.\n\nScale: Selected notes.\nMIDI: MIDI input.\nSidechain: Sidechain input.";
-        if(c == &fullMidiBtn) return "Full MIDI\n\nWhen enabled, each MIDI note targets only the exact frequency played instead of the same note in every octave.";
         if(c == &moreBasesBtn) return "More Bases\n\nDetects and accepts more fundamentals in the candidate range.";
         if(c == &hysteresisBtn) return "Hysteresis\n\nStabilises fundamental detection over time. \nFundamentals with high confidence persist through brief dropouts and resist flicker between nearby target pitches.";
         if(c == &midSideBtn) return "Stereo\n\nSelect the stereo processing domain.\n\nLeft - Right: \nprocess channels independently.\nMid - Side: \nprocess Mid and Side components.";
@@ -1611,13 +1614,12 @@ void FluorescenceAudioProcessorEditor::resized()
         auto togglesRow = inner.removeFromTop(togH);
         const int rowX = togglesRow.getX();
         const int rowW = togglesRow.getWidth();
-        const int toggleColW = rowW / 3;
+        const int toggleColW = rowW / 2;
         const int tGap = 6;
         const int tY = togglesRow.getY();
         const int toggleH = togglesRow.getHeight();
-        fullMidiBtn.setBounds(rowX, tY, toggleColW - tGap, toggleH);
-        moreBasesBtn.setBounds(rowX + toggleColW, tY, toggleColW - tGap, toggleH);
-        hysteresisBtn.setBounds(rowX + toggleColW * 2, tY, rowW - toggleColW * 2, toggleH);
+        moreBasesBtn.setBounds(rowX, tY, toggleColW - tGap, toggleH);
+        hysteresisBtn.setBounds(rowX + toggleColW, tY, rowW - toggleColW, toggleH);
     }
     if(flyoutA.isOpen())
         flyoutA.toFront(false);

@@ -466,7 +466,6 @@ private:
     std::unique_ptr<juce::FileChooser> skinChooser;
     bool presetChooserActive = false;
     SmoothComboBox fftSizeBox, overlapBox;
-    SmoothToggleButton fullMidiBtn { "FULL MIDI" };
     SmoothToggleButton moreBasesBtn { "MORE BASES" };
     SmoothToggleButton hysteresisBtn { "HYSTERESIS" };
     SmoothTextButton midSideBtn { "LEFT - RIGHT" };
@@ -499,7 +498,7 @@ private:
                 oddEvenBalanceLbl,
                 scTransposeLbl, targetLbl;
     std::unique_ptr<CA> fftAtt, overlapAtt, modeAtt;
-    std::unique_ptr<BA> bypassAtt, fullMidiAtt, moreBasesAtt, midSideAtt, hysteresisAtt;
+    std::unique_ptr<BA> bypassAtt, moreBasesAtt, midSideAtt, hysteresisAtt;
     std::unique_ptr<BA> enhanceTransientAtt;
     std::unique_ptr<SA> transientAtt, transposeAtt, attractionAtt, emphasisAtt,
                         morphAtt, densityAtt, feedbackAtt, fineTuneAtt, envCompAtt, oddEvenBalanceAtt,

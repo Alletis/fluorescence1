@@ -11,7 +11,13 @@ class KeyButton : public juce::Component,
 public:
     std::function<void(int)> onValueChange;
     std::function<void()> onMenuRequest;
-    KeyButton() { startTimerHz(60); }
+    explicit KeyButton(int maximumIndex = 11, bool wrap = true)
+        : maxIndex(maximumIndex), wrapIndex(wrap)
+    {
+        startTimerHz(60);
+    }
+    std::function<juce::String(int)> formatValue;
+    juce::Rectangle<int> valueBounds() const { return regionBounds(Region::title); }
     ~KeyButton() override { stopTimer(); }
     void setMagentaAccent(bool enabled)
     {
@@ -20,7 +26,8 @@ public:
     }
     void setIndex(int i, bool notify = false)
     {
-        const int n = ((i % 12) + 12) % 12;
+        const int count = maxIndex + 1;
+        const int n = wrapIndex ? ((i % count) + count) % count : juce::jlimit(0, maxIndex, i);
         if(n != index)
         {
             index = n;
@@ -67,7 +74,7 @@ public:
         g.setColour(colours[1].foreground.get());
         g.setFont(KnobLookAndFeel::courier(
             juce::jlimit(8.0f, 40.0f, (float) getHeight() * 0.50f)));
-        g.drawFittedText(noteName(index), regionBounds(Region::title).reduced(3, 1),
+        g.drawFittedText(formatValue ? formatValue(index) : noteName(index), regionBounds(Region::title).reduced(3, 1),
                          juce::Justification::centred, 1);
     }
     void mouseDown(const juce::MouseEvent& e) override
@@ -253,6 +260,8 @@ private:
             repaint();
     }
     static constexpr float pixelsPerStep = 16.0f;
+    const int maxIndex;
+    const bool wrapIndex;
     int index = 0;
     int appliedSteps = 0;
     bool changed = false;
