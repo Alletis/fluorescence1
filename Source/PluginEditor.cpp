@@ -1091,9 +1091,9 @@ juce::String FluorescenceAudioProcessorEditor::findHoverHintTextForComponent(juc
             {
                 const auto t = btn->getButtonText().trim().toUpperCase();
                 if(t == "FULL MIDI")
-                    return "Full MIDI\n\nTargets only one exact MIDI pitch. When off, the target repeats across octaves.";
+                    return "Full MIDI\n\nTargets only one exact MIDI pitch. \nWhen off, the target repeats across octaves.";
                 if(t == "MPE")
-                    return "MPE\n\nFollows the pitch curve of each note and adds ordinary pitch bend. \nIn some DAWs, enable MPE Mode in the VST3 headers.";
+                    return "MPE\n\nFollows pitch curve of each note using MPE. \nIn some DAWs, enable MPE Mode in the VST3 headers.";
                 if(t == "FULL" || t == "CLEAR")
                     return "Scale Full/Clear\n\nQuickly selects or removes all notes.";
                 return "Scale Selector\n\nSelect any scale or chord preset from the drop-down menu to the current set key.\nAny modification to the Piano Roll disables the current chosen preset.";
