@@ -174,9 +174,7 @@ FluorescenceAudioProcessor::createLayout()
     params.push_back(std::make_unique<juce::AudioParameterBool>(
         juce::ParameterID { "hysteresis", 1 }, "Hysteresis", false));
     params.push_back(std::make_unique<juce::AudioParameterInt>(
-        juce::ParameterID { "midiBendRange", 1 }, "Pitch Bend Range", 0, 96, 0,
-        juce::AudioParameterIntAttributes().withStringFromValueFunction(
-            [] (int range, int) { return range == 0 ? juce::String("Auto") : juce::String(range); })));
+        juce::ParameterID { "midiBendRange", 1 }, "Pitch Bend Range", 0, 96, 2));
     params.push_back(std::make_unique<juce::AudioParameterBool>(
         juce::ParameterID { "mpe", 1 }, "MPE", false));
     return { params.begin(), params.end() };
@@ -3459,14 +3457,13 @@ void FluorescenceAudioProcessor::updateMidiTargets()
         const int delta = wheel - 8192;
         return(float) delta * (float) semitones / (delta > 0 ? 8191.0f : 8192.0f);
     };
-    const int wheelRange = range != 0 ? range : 2;
-    const float globalBend = mpe ? bend(midiChannels.front().wheel, wheelRange) : 0.0f;
+    const float globalBend = mpe ? bend(midiChannels.front().wheel, range) : 0.0f;
     constexpr int mpeNoteRange = 48;
     for(size_t channel = 0; channel < midiChannels.size(); ++channel)
     {
         const auto& state = midiChannels[channel];
         const float noteExpression = mpe && channel != 0 ? bend(state.wheel, mpeNoteRange) : 0.0f;
-        const float pitchBend = mpe ? globalBend : bend(state.wheel, wheelRange);
+        const float pitchBend = mpe ? globalBend : bend(state.wheel, range);
         const float offset = pitchBend + noteExpression;
         for(size_t note = 0; note < state.held.size(); ++note)
         {

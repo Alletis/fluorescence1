@@ -37,8 +37,7 @@ public:
         styleLabel(midiControls, bendLbl, "BEND RANGE");
         bendBtn.setComponentID("midiBendRange");
         bendBtn.setMagentaAccent(true);
-        bendBtn.formatValue = [] (int range) { return range == 0 ? juce::String("Auto")
-                                                                : juce::String(range) + " st"; };
+        bendBtn.formatValue = [] (int range) { return juce::String(range) + " st"; };
         midiControls.addAndMakeVisible(bendBtn);
         midiControls.addAndMakeVisible(fullMidiBtn);
         midiControls.addAndMakeVisible(mpeBtn);
@@ -52,7 +51,7 @@ public:
         bendBtn.onMenuRequest = [this]
         {
             const int range = bendBtn.getIndex();
-            bendEditor.setText(range == 0 ? juce::String("Auto") : juce::String(range),
+            bendEditor.setText(juce::String(range),
                                juce::dontSendNotification);
             bendEditor.setVisible(true);
             bendEditor.showEditor();
@@ -61,9 +60,7 @@ public:
         bendEditor.onTextChange = [this]
         {
             const auto text = bendEditor.getText().trim();
-            if(text.equalsIgnoreCase("Auto"))
-                bendBtn.setIndex(0, true);
-            else if(text.isNotEmpty() && text.containsOnly("0123456789"))
+            if(text.isNotEmpty() && text.containsOnly("0123456789"))
                 bendBtn.setIndex(text.substring(0, 3).getIntValue(), true);
         };
         bendAttachment = std::make_unique<juce::ParameterAttachment>(
@@ -79,7 +76,7 @@ public:
         restoreUiState();
         targetControlsPhase = midiOn() ? 1.0f : -1.0f;
         updateTargetControls();
-        startTimerHz(30);
+        startTimerHz(60);
     }
     ~ScalePanel() override { stopTimer(); }
     void syncFromApvtsState()

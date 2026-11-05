@@ -1045,7 +1045,7 @@ void FluorescenceAudioProcessorEditor::handleGlobalMouseMove(const juce::MouseEv
     {
         const auto p = e.getEventRelativeTo(&content).position.toInt();
         if(logoArea.contains(p))
-            hintText = "-\n\nVersion: 1.1.8";
+            hintText = "-\n\nVersion: 1.1.9";
     }
     hoverHintBox.setHintText(hintText);
     ValueKnob* knob = nullptr;
@@ -1084,7 +1084,7 @@ juce::String FluorescenceAudioProcessorEditor::findHoverHintTextForComponent(juc
         if(isInsideScalePanel(c))
         {
             if(c->getComponentID() == "midiBendRange")
-                return "Pitch Bend Range\n\nClick to type a semitone range or Auto. Drag or use the arrows to step. Auto uses 2 semitones for ordinary pitch bend. MPE note curves use a separate 48-semitone range.";
+                return "Pitch Bend Range\n\nChanges the pitch bend range in semitones.";
             if(dynamic_cast<KeyButton*> (c) != nullptr)
                 return "Scale Key\n\nSelect the root key for the scales.\nChanges automatically shift the scale while a preset is active.";
             if(auto* btn = dynamic_cast<juce::Button*> (c))
