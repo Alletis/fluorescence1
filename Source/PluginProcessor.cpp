@@ -924,7 +924,7 @@ float FluorescenceAudioProcessor::membershipSigma(int harmonic, float freqHz) co
     const float hi = juce::jmax(lo, membershipSigmaCents);
     return juce::jlimit(lo, hi, membershipGapFrac * gapCents);
 }
-void FluorescenceAudioProcessor::updateBaseTracker(int channel, float frameTonal)
+void FluorescenceAudioProcessor::updateBaseTracker(int channel, float frameTonal, float targetOffsetMidi)
 {
     auto& T = tracked[(size_t) channel];
     const bool hystOn = (hysteresisParam != nullptr) && (hysteresisParam->load() >= 0.5f);
@@ -941,7 +941,9 @@ void FluorescenceAudioProcessor::updateBaseTracker(int channel, float frameTonal
     const float relDecay = juce::jlimit(0.01f, 1.0f, hopSec / juce::jmax(1.0e-4f, releaseMs * 0.001f));
     const float dedupeTolCents = 60.0f;
     const float claimHi = 0.6f;
-    const float hyst = 0.1f;
+    constexpr float hyst = 0.10f;
+    constexpr float minBaseHysteresisMidi = 0.10f;
+    const float targetOffsetRatio = std::exp2(-targetOffsetMidi / 12.0f);
     const float claimLo = 0.45f;
     const float heldValidTolMidi = 0.5f;
     const float salHoldDecay = 0.80f;
@@ -1034,7 +1036,7 @@ void FluorescenceAudioProcessor::updateBaseTracker(int channel, float frameTonal
         t.conf = juce::jlimit(0.0f, 1.0f, t.conf + claimRise);
         if(t.conf >= claimHi)
             t.claimed = true;
-        const float tgtNow = nearestTargetMidi(t.freq);
+        const float tgtNow = nearestTargetMidi(t.freq * targetOffsetRatio);
         if(tgtNow < -900.0f)
         {
             t.heldTargetMidi = -1000.0f;
@@ -1065,8 +1067,10 @@ void FluorescenceAudioProcessor::updateBaseTracker(int channel, float frameTonal
                     const float span = tgtNow - t.heldTargetMidi;
                     if(std::abs(span) > 1.0e-4f)
                     {
-                        const float x = (baseMidi - t.heldTargetMidi) / span;
-                        if(x > 0.5f + hyst)
+                        const float midpointMidi = t.heldTargetMidi + 0.5f * span + targetOffsetMidi;
+                    const float midpointDistance = baseMidi - midpointMidi;
+                        if((span > 0.0f ? midpointDistance : -midpointDistance)
+                           > juce::jmax(minBaseHysteresisMidi, hyst * std::abs(span)))
                             t.heldTargetMidi = tgtNow;
                     }
                     else
@@ -1107,7 +1111,7 @@ void FluorescenceAudioProcessor::updateBaseTracker(int channel, float frameTonal
         {
             auto& t = T[(size_t) k];
             if(! t.active || ! t.claimed || t.heldTargetMidi < -900.0f) continue;
-            const float tgtNow = nearestTargetMidi(t.freq);
+            const float tgtNow = nearestTargetMidi(t.freq * targetOffsetRatio);
             bool ambiguous = false;
             if(tgtNow > -900.0f && std::abs(tgtNow - t.heldTargetMidi) > 0.01f)
             {
@@ -1115,8 +1119,9 @@ void FluorescenceAudioProcessor::updateBaseTracker(int channel, float frameTonal
                 const float span = tgtNow - t.heldTargetMidi;
                 if(std::abs(span) > 1.0e-4f)
                 {
-                    const float x = (baseMidi - t.heldTargetMidi) / span;
-                    ambiguous = (std::abs(x - 0.5f) < ambigBand);
+                    const float midpointMidi = t.heldTargetMidi + 0.5f * span + targetOffsetMidi;
+                    const float midpointDistance = baseMidi - midpointMidi;
+                    ambiguous = std::abs(midpointDistance) < ambigBand * std::abs(span);
                 }
             }
             if(! ambiguous) continue;
@@ -1274,12 +1279,10 @@ void FluorescenceAudioProcessor::rebuildHarmonicPeakList(int channel, float fram
         int bestBase = -1;
         int bestHarmonic = 0;
         float bestDeviation = 1.0e30f;
-        auto considerBase = [&] (int encodedBase, float baseHz, float baseLog2)
+        float bestIdealLog = 0.0f, secondIdealLog = 0.0f;
+        float secondDeviation = 1.0e30f;
+        auto considerHarmonic = [&] (int encodedBase, float baseHz, float baseLog2, int harmonic)
         {
-            if(baseHz <= 0.0f)
-                return;
-            const int harmonic = juce::jmax(1,
-                (int) std::lround(peakHz / baseHz));
             const float idealHz = (float) harmonic * baseHz;
             if(idealHz <= 0.0f || idealHz >= nyquist)
                 return;
@@ -1288,15 +1291,38 @@ void FluorescenceAudioProcessor::rebuildHarmonicPeakList(int channel, float fram
                 : std::log2((float) harmonic);
             const float deviation = 1200.0f * std::abs(peakLog2 - harmonicLog2 - baseLog2);
             const float tolerance = membershipSigma(harmonic, peakHz);
-            if(deviation <= tolerance && deviation < bestDeviation)
+            if(deviation > tolerance)
+                return;
+            const float idealLog = harmonicLog2 + baseLog2;
+            if(deviation < bestDeviation)
             {
+                secondDeviation = bestDeviation;
+                secondIdealLog = bestIdealLog;
                 bestDeviation = deviation;
+                bestIdealLog = idealLog;
                 bestBase = encodedBase;
                 bestHarmonic = harmonic;
             }
+            else if(deviation < secondDeviation)
+            {
+                secondDeviation = deviation;
+                secondIdealLog = idealLog;
+            }
         };
         for(const auto& base : flatBaseCandidates)
-            considerBase(base.encodedIndex, base.hz, base.log2Hz);
+        {
+            if(base.hz <= 0.0f)
+                continue;
+            const float ratio = peakHz / base.hz;
+            const int nearest = juce::jmax(1, (int) std::lround(ratio));
+            considerHarmonic(base.encodedIndex, base.hz, base.log2Hz, nearest);
+            if(hysteresisOn)
+            {
+                const int adjacent = ratio < (float) nearest ? nearest - 1 : nearest + 1;
+                if(adjacent >= 1)
+                    considerHarmonic(base.encodedIndex, base.hz, base.log2Hz, adjacent);
+            }
+        }
         if(usePeakHysteresis)
         {
             const Partial* heldPartial = nullptr;
@@ -1403,9 +1429,14 @@ void FluorescenceAudioProcessor::rebuildHarmonicPeakList(int channel, float fram
                                 bool keepHeld = true;
                                 if(idealSeparationCents >= 5.0f)
                                 {
-                                    const float position = (peakLog2 - heldLog) / span;
-                                    constexpr float switchMargin = 0.10f;
-                                    const bool crossedBoundary = position > 0.5f + switchMargin;
+                                    const float midpointLog = heldLog + 0.5f * span;
+                                    const float closestGap = secondDeviation < 1.0e30f
+                                        ? 1200.0f * std::abs(bestIdealLog - secondIdealLog)
+                                        : idealSeparationCents;
+                                    const float marginCents = 0.10f * juce::jmin(closestGap, idealSeparationCents);
+                                    const bool crossedBoundary =
+                                        1200.0f * (span > 0.0f ? peakLog2 - midpointLog
+                                                            : midpointLog - peakLog2) > marginCents;
                                     if(bestDeviation < heldDeviation && crossedBoundary)
                                         keepHeld = false;
                                 }
@@ -1555,7 +1586,7 @@ void FluorescenceAudioProcessor::detect(int channel)
     const float firstSal = discovery.firstSalience;
     const float tonalNow = juce::jlimit(0.0f, 1.0f,
                                         firstSal / (tonalRefScale * (totalPeak + 1.0e-12f)));
-    updateBaseTracker(channel, tonalNow);
+    updateBaseTracker(channel, tonalNow, heldFineSemis);
     for(int b = 0; b < numBases; ++b)
         baseLog2Hz[(size_t) b] = (baseFreq[(size_t) b] > 0.0f)
                                     ? std::log2 (baseFreq[(size_t) b]) : -1.0e30f;
@@ -1768,6 +1799,16 @@ void FluorescenceAudioProcessor::detect(int channel)
             const float ln = (n <= harmonicsTagMax) ? log2IntTable[(size_t) n] : std::log2 ((float) n);
             const float dev = 1200.0f * std::abs(log2fk - ln - baseLog2Hz[(size_t) b]);
             if(dev < bestDev) { bestDev = dev; bestBase = b; bestN = n; }
+        }
+        const int assignedBase = peakBaseIdx[(size_t) i];
+        const int assignedHarmonic = peakHarmonic[(size_t) i];
+        if(hysteresisParam != nullptr && hysteresisParam->load() >= 0.5f
+           && assignedBase >= 0 && assignedBase < numBases && assignedHarmonic >= 1)
+        {
+            bestBase = assignedBase;
+            bestN = assignedHarmonic;
+            bestDev = 1200.0f * std::abs(log2fk
+                - std::log2((float) bestN) - baseLog2Hz[(size_t) bestBase]);
         }
         const bool isSuper = (fk > fMax);
         const float Fb = baseFreq[(size_t) bestBase];

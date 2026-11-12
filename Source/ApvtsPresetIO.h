@@ -62,8 +62,6 @@ namespace ApvtsPresetIO
         if(! incoming.isValid() || ! current.isValid()
             || ! incoming.hasType(current.getType()))
             return juce::Result::fail("Not a compatible APVTS state tree.");
-        if(incoming.getNumChildren() != current.getNumChildren())
-            return juce::Result::fail("Parameter count does not match this plugin.");
         juce::StringArray seen;
         for(int i = 0; i < incoming.getNumChildren(); ++i)
         {
@@ -135,12 +133,16 @@ namespace ApvtsPresetIO
         if(check.failed())
             return check;
         auto merged = current.createCopy();
-        for(int i = 0; i < incoming.getNumChildren(); ++i)
+        for(int i = 0; i < merged.getNumChildren(); ++i)
         {
-            const auto src = incoming.getChild(i);
-            auto dst = merged.getChildWithProperty(idKey, src.getProperty(idKey));
-            double n = 0.0;
-            if(! parseFiniteNumber(src.getProperty(valueKey), n))
+            auto dst = merged.getChild(i);
+            const auto id = dst.getProperty(idKey).toString();
+            auto* parameter = apvts.getParameter(id);
+            if(parameter == nullptr)
+                continue;
+            const auto src = incoming.getChildWithProperty(idKey, id);
+            double n = parameter->convertFrom0to1(parameter->getDefaultValue());
+            if(src.isValid() && ! parseFiniteNumber(src.getProperty(valueKey), n))
                 return juce::Result::fail("Unexpected invalid parameter during merge.");
             dst.setProperty(valueKey, n, nullptr);
         }

@@ -376,7 +376,7 @@ private:
     };
     static constexpr int maxTracked = maxBases;
     std::array<std::array<TrackedBase, maxTracked>, maxChannels> tracked {};
-    void updateBaseTracker(int channel, float frameTonal);
+    void updateBaseTracker(int channel, float frameTonal, float targetOffsetMidi);
     float membershipSigma(int harmonic, float freqHz) const;
     struct DetectionFrameParams
     {
